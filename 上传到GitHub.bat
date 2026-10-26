@@ -15,7 +15,7 @@ set "GIT=git"
 where git >nul 2>nul
 if not errorlevel 1 goto found
 if exist "%ProgramFiles%\Git\cmd\git.exe" set "GIT=%ProgramFiles%\Git\cmd\git.exe"
-if exist "%ProgramFiles%\Git\bin\git.exe" set "GIT=%ProgramFiles%\Git\bin\git.exe"
+if exist "%ProgramFiles%\Gitin\git.exe" set "GIT=%ProgramFiles%\Gitin\git.exe"
 if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" set "GIT=%LOCALAPPDATA%\Programs\Git\cmd\git.exe"
 
 :found
