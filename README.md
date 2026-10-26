@@ -362,7 +362,3 @@ python -m PyInstaller --noconfirm --onefile --windowed --name 桌面工作台 --
 ```
 
 异常日志：`%LOCALAPPDATA%\SideExplorer\error.log`
-
-
-
-
