@@ -7,16 +7,18 @@ set "HTTPS_PROXY="
 set "http_proxy="
 set "https_proxy="
 
-REM 找 git：先看 PATH，再找 WorkBuddy 自带的 PortableGit
-REM 注意 PortableGit 的 git.exe 在 cmd\ 下，不在 bin\ 下
+REM SSH 第一次连 github.com 时自动接受主机指纹，不然会卡在 yes/no 提示上
+set "GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new"
+
+REM 找 git：先看 PATH，再看几个常见安装位置（不依赖 PATH 是否已生效）
 set "GIT=git"
 where git >nul 2>nul
-if errorlevel 1 (
-    for /d %%D in ("%USERPROFILE%\.workbuddy\binaries\PortableGit\versions\*") do (
-        if exist "%%~fD\cmd\git.exe" set "GIT=%%~fD\cmd\git.exe"
-        if exist "%%~fD\bin\git.exe" set "GIT=%%~fD\bin\git.exe"
-    )
-)
+if not errorlevel 1 goto found
+if exist "%ProgramFiles%\Git\cmd\git.exe" set "GIT=%ProgramFiles%\Git\cmd\git.exe"
+if exist "%ProgramFiles%\Git\bin\git.exe" set "GIT=%ProgramFiles%\Git\bin\git.exe"
+if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" set "GIT=%LOCALAPPDATA%\Programs\Git\cmd\git.exe"
+
+:found
 "%GIT%" --version >nul 2>nul
 if errorlevel 1 (
     echo.
