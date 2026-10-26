@@ -3,6 +3,11 @@ SideExplorer.json
 SideExplorer.json.bak
 *.json.tmp
 
+# 本机专属启动器（含这台机器的 Python 绝对路径）
+启动.lnk
+桌面工作台.vbs
+桌面工作台-看报错.bat
+
 # Python
 __pycache__/
 *.py[cod]
