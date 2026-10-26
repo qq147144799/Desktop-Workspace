@@ -31,3 +31,4 @@ desktop.ini
 
 # 本地临时
 *.log
+# 注意：上传到GitHub.bat 必须用 GBK 编码保存（cmd 默认按 936 解析，UTF-8 会乱码）
