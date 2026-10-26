@@ -1,0 +1,28 @@
+# 运行期个人数据：便签内容、算式历史、快捷位置、最后浏览路径都在里面
+SideExplorer.json
+SideExplorer.json.bak
+*.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+dist_*/
+build_*/
+*.spec
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地临时
+*.log
