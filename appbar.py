@@ -127,6 +127,24 @@ class AppBar:
         self.rect = (abd.rc.left, abd.rc.top, abd.rc.right, abd.rc.bottom)
         return self.rect
 
+    def query(self, screen_size: tuple[int, int] | None = None) -> tuple[int, int, int, int] | None:
+        """只问系统这块位置能不能用，不登记占位（用于响应 ABN_POSCHANGED，避免广播循环）。"""
+        if not self.registered:
+            return None
+        screen_w, screen_h = screen_size or primary_screen_size()
+        abd = self._abd()
+        if self.edge == "right":
+            abd.rc = RECT(screen_w - self.width, 0, screen_w, screen_h)
+        else:
+            abd.rc = RECT(0, 0, self.width, screen_h)
+        if not shell32.SHAppBarMessage(ABM_QUERYPOS, ctypes.byref(abd)):
+            return None
+        if self.edge == "right":
+            abd.rc.left = abd.rc.right - self.width
+        else:
+            abd.rc.right = abd.rc.left + self.width
+        return (abd.rc.left, abd.rc.top, abd.rc.right, abd.rc.bottom)
+
     def set_width(self, width_px: int, screen_size: tuple[int, int] | None = None):
         self.width = max(220, int(width_px))
         return self.place(screen_size)

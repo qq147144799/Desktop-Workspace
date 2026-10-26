@@ -2568,6 +2568,78 @@ class SideExplorer(QWidget):
         self._init_appbar()
         self.show()
         QTimer.singleShot(60, self._sync_appbar)
+        self._watch_screen()
+
+        # 兜底：窗口位置被外部改掉（系统重排、缩放临时变化）时自动纠回来
+        self._guard_timer = QTimer(self)
+        self._guard_timer.setInterval(4000)
+        self._guard_timer.timeout.connect(self._verify_placement)
+        self._guard_timer.start()
+
+    def _watch_screen(self) -> None:
+        """监听屏幕尺寸 / DPI / 显示器增减，变了就重新钉一次应用栏。"""
+        app = QApplication.instance()
+        if app is not None and not getattr(self, "_screen_hooked", False):
+            app.primaryScreenChanged.connect(self._on_screen_changed)
+            app.screenAdded.connect(self._on_screen_changed)
+            app.screenRemoved.connect(self._on_screen_changed)
+            self._screen_hooked = True
+
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        for sig in (screen.geometryChanged, screen.logicalDotsPerInchChanged):
+            try:
+                sig.disconnect(self._on_screen_changed)
+            except (RuntimeError, TypeError):
+                pass
+            sig.connect(self._on_screen_changed)
+
+    def _on_screen_changed(self, *args) -> None:
+        # 屏幕一变，原来占的那块地就失效了，重新注册最保险
+        QTimer.singleShot(150, self._remount_appbar)
+
+    def _remount_appbar(self) -> None:
+        if self.appbar is None:
+            return
+        self._watch_screen()
+        self.appbar.remove()
+        self.appbar.register()
+        self._sync_appbar()
+
+    def _on_pos_changed(self) -> None:
+        """系统通知可用区域变了。
+
+        这里只按新位置摆窗口，**不**再调 ABM_SETPOS —— 因为 SETPOS 会向所有
+        应用栏广播 ABN_POSCHANGED（包括自己），一路循环下去窗口就会自己漂移。
+        """
+        if self.appbar is None or self._syncing:
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_last_pos_change", 0.0) < 0.8:
+            return                          # 防抖：同一轮只处理一次
+        self._last_pos_change = now
+
+        rect = self.appbar.query(primary_screen_size())
+        if not rect:
+            return
+        dpr = self._dpr()
+        l, t, r, b = rect
+        self.setGeometry(round(l / dpr), round(t / dpr),
+                         round((r - l) / dpr), round((b - t) / dpr))
+
+    def _verify_placement(self) -> None:
+        """定时校验：窗口实际位置和应用栏登记的位置不一致就纠正。"""
+        if self.appbar is None or not self.appbar.rect or self._syncing:
+            return
+        if not self.isVisible():
+            return
+        dpr = self._dpr()
+        l, t, r, b = self.appbar.rect
+        want = QRect(round(l / dpr), round(t / dpr),
+                     round((r - l) / dpr), round((b - t) / dpr))
+        if self.geometry() != want:
+            self._sync_appbar()
 
     def _apply_width(self, logical_width: int) -> None:
         width = max(self.MIN_WIDTH, min(self.MAX_WIDTH, int(logical_width)))
@@ -2653,7 +2725,7 @@ class SideExplorer(QWidget):
                 return True, 1             # MA_ACTIVATE
             if self.appbar is not None and self.appbar.owns_message(msg.message):
                 if msg.wParam == ABN_POSCHANGED:
-                    QTimer.singleShot(0, self._sync_appbar)
+                    QTimer.singleShot(0, self._on_pos_changed)
                 return True, 0
         except Exception:
             pass
