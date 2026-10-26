@@ -6,31 +6,27 @@
 
 ---
 
-## 启动
+## 运行
 
-**双击桌面上的「桌面工作台」快捷方式**（或程序目录里的 `启动.lnk`）。
-这个快捷方式指向本机 Python，**不经过智能应用控制的 exe 拦截，永远不会被拦**。
+需要 **Python 3.10+**、**PySide6**，只在 Windows 上可用（依赖 AppBar API）。
 
-| 入口 | 稳定性 | 说明 |
-| --- | --- | --- |
-| **桌面快捷方式 / `启动.lnk`** | ✅ 稳定 | 推荐，无窗口，图标是 `app.ico` |
-| `桌面工作台.vbs` | ✅ 稳定 | 同上，等价 |
-| `桌面工作台.exe` | ⚠️ 看运气 | 每次重新打包指纹都变，SAC 可能拦 |
+```bash
+pip install PySide6
+python main.py
+```
 
-> **为什么 exe 时好时坏？**
-> 这台机器开着「智能应用控制（SAC）」，它拦所有没有数字签名的 exe。
-> 每次重新打包，exe 的指纹都变，SAC 就重新评估一次——有时放行，有时弹
-> 「智能应用控制已阻止可能不安全的应用」。这不是程序坏了，是系统策略。
-> 想彻底避开，就用上面的快捷方式走 Python，别碰 exe。
+不想留黑窗口就用 `pythonw main.py`。
 
-其它文件：
+想做成单文件绿色版：
 
-| 文件 | 用途 |
-| --- | --- |
-| `启动.lnk` | **日常启动（推荐）** |
-| `桌面工作台.vbs` | 等价入口，快捷方式失效时用 |
-| `桌面工作台.exe` | 绿色单文件，被 SAC 拦就用上面两个 |
-| `桌面工作台-看报错.bat` | 出问题时用，会留黑窗口显示错误 |
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed --name "桌面工作台" --icon app.ico --add-data "app.ico;." main.py
+```
+
+> **exe 被拦的话**：Windows 的「智能应用控制（SAC）」会拦所有没有数字签名的 exe，
+> 且每次重新打包指纹都变，SAC 就重新判定一次。绕开它很简单——直接跑 Python，
+> 或者建一个指向 `pythonw.exe main.py` 的快捷方式（`.lnk` 不受 SAC 管）。
 
 只允许运行一个实例，重复启动不会开出第二个面板。
 
@@ -340,22 +336,24 @@ Word/Excel/WPS 都能正常打开。
 
 ```
 SideExplorer/
-├── 桌面工作台.exe        绿色版主程序
-├── SideExplorer.json    配置 + 便签 + 回收站（自动生成，可删）
-├── 启动.vbs             推荐启动方式（无控制台）
-├── 启动.bat             同上，带黑框
+├── main.py              入口：单实例锁、QApplication、启动窗口
+├── ui.py                主窗口：分栏、文件列表、快捷位置、菜单、托盘
 ├── appbar.py            Win32 应用栏封装（左右两侧、宽度、位置）
 ├── windowtray.py        窗口收纳（隐藏 / 恢复其它窗口）
-├── ui.py                主窗口：分栏、文件列表、快捷位置、菜单、托盘
-├── fileops.py           文件剪贴板、回收站、复制/移动、模板新建
+├── fileops.py           文件剪贴板、删除到回收站、复制/移动、模板新建
+├── shelldrag.py         解析 Win11 拖拽的 Shell IDList → 真实路径
 ├── shellnew.py          系统「新建」菜单读取 + 内置 OOXML 模板
-├── notes.py             便签数据、颜色、时间、CSV、回收站
-├── notes_panel.py       便签面板：列表、颜色 / 提醒 / 排序、提醒定时器
+├── archive.py           压缩包浏览、解压、压缩
+├── notes.py             便签数据、颜色、时间、CSV、归档
+├── notes_panel.py       便签面板：列表、颜色 / 提醒 / 排序
+├── theme.py             配色与样式表
 ├── config.py            JSON 配置读写
-├── main.py              入口：DPI、单实例、中文翻译、异常日志
-├── app.ico              图标
+├── app.ico              程序图标
 └── README.md
 ```
+
+运行后会在同目录生成 `SideExplorer.json`（配置 + 便签 + 算式历史），
+**已加入 .gitignore**，不会进仓库。
 
 改动源码后重新打包：
 
