@@ -25,11 +25,13 @@ from PySide6.QtCore import (QAbstractListModel, QEvent, QFileInfo, QMimeData,
 from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QFont, QFontMetrics,
                            QIcon, QKeySequence, QPainter, QPainterPath, QPen,
                            QPixmap, QPolygonF, QShortcut)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileIconProvider,
-                               QFrame, QHBoxLayout, QInputDialog, QLabel,
-                               QLayout, QLineEdit, QListView, QMenu, QMessageBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
+                               QDialogButtonBox, QFileIconProvider, QFrame,
+                               QHBoxLayout, QInputDialog, QLabel, QLayout,
+                               QLineEdit, QListView, QListWidget,
+                               QListWidgetItem, QMenu, QMessageBox,
                                QProgressDialog, QPushButton, QScrollArea,
-                               QSplitter, QStyle,
+                               QSizePolicy, QSplitter, QStyle,
                                QStyledItemDelegate, QSystemTrayIcon, QToolButton,
                                QVBoxLayout, QWidget)
 
@@ -38,7 +40,6 @@ import fileops
 import shelldrag
 import shellnew
 import theme
-import windowtray
 from appbar import AppBar, primary_screen_size
 from config import Config
 from notes_panel import NotesPanel
@@ -978,6 +979,87 @@ class HScrollArea(QScrollArea):
         event.accept()
 
 
+class WindowPickerDialog(QDialog):
+    """列出当前打开的窗口（按程序去重），勾选要「后台运行」的那些。"""
+
+    def __init__(self, windows: list[dict], existing: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择窗口")
+        self.setMinimumWidth(420)
+        self.resize(460, 420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        tip = QLabel("勾选你要保护的程序：以后点它们的关闭按钮，只会缩到托盘并继续运行。")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("输入关键字过滤…")
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        layout.addWidget(self.filter_edit)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QAbstractItemView.NoSelection)
+        self.list.setAlternatingRowColors(True)
+        self.list.setIconSize(QSize(20, 20))
+        self.list.setWordWrap(False)
+        self.list.setTextElideMode(Qt.ElideRight)          # 长标题省略，别硬切
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        layout.addWidget(self.list, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.shown_exes: list[str] = []
+        providers = QFileIconProvider()
+        known = {e.lower() for e in existing}
+        for win in windows:
+            label = f"{win['exe']}    {win['title']}"
+            if win["count"] > 1:
+                label += f"    （{win['count']} 个窗口）"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, win["exe"])
+            item.setToolTip(win.get("exe_path") or win["exe"])
+            path = win.get("exe_path") or ""
+            if path and os.path.isfile(path):
+                item.setIcon(providers.icon(QFileInfo(path)))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if win["exe"] in known else Qt.Unchecked)
+            if win["exe"] in known:
+                item.setText(label + "    （已添加）")
+            self.shown_exes.append(win["exe"])
+            self.list.addItem(item)
+
+        if self.list.count() == 0:
+            empty = QListWidgetItem("（没找到可选的窗口）")
+            empty.setFlags(Qt.NoItemFlags)
+            self.list.addItem(empty)
+
+    def _apply_filter(self, text: str) -> None:
+        needle = (text or "").strip().lower()
+        for row in range(self.list.count()):
+            item = self.list.item(row)
+            hide = bool(needle) and needle not in item.text().lower()
+            item.setHidden(hide)
+
+    def selected_exes(self) -> list[str]:
+        picked = []
+        for row in range(self.list.count()):
+            item = self.list.item(row)
+            if item.flags() & Qt.ItemIsUserCheckable and item.checkState() == Qt.Checked:
+                exe = item.data(Qt.UserRole)
+                if exe:
+                    picked.append(exe)
+        return picked
+
+
 STYLE = ""  # 由 theme.build_qss() 动态生成
 
 
@@ -998,8 +1080,8 @@ class SideExplorer(QWidget):
         self.edge = str(self.settings.value("edge", "left"))
         if self.edge not in ("left", "right"):
             self.edge = "left"
-        self._hidden_windows: list[tuple[int, str]] = []
         self.click_to_open = self.settings.value("click_to_open", False, bool)
+        self._really_quit = False
         self._expr_history: list[dict] = self._load_expr_history()
         if self.settings.value("expr_history", []) != self._expr_history:
             self._save_expr_history()      # 把旧版存成字符串的数据迁移成正常列表
@@ -1080,6 +1162,9 @@ class SideExplorer(QWidget):
         header = QFrame()
         header.setObjectName("Header")
         header.setFixedHeight(38)
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(
+            lambda pos, w=header: self.show_main_menu_at(w.mapToGlobal(pos)))
         hl = QHBoxLayout(header)
         hl.setContentsMargins(10, 0, 8, 0)
         hl.setSpacing(2)
@@ -1087,6 +1172,9 @@ class SideExplorer(QWidget):
         title = QLabel("桌面工作台")
         title.setObjectName("Title")
         title.setAlignment(Qt.AlignCenter)
+        title.setContextMenuPolicy(Qt.CustomContextMenu)
+        title.customContextMenuRequested.connect(
+            lambda pos, w=title: self.show_main_menu_at(w.mapToGlobal(pos)))
         hl.addStretch(1)
         hl.addWidget(title)
         hl.addStretch(1)
@@ -1188,6 +1276,11 @@ class SideExplorer(QWidget):
         sl = QHBoxLayout(status)
         sl.setContentsMargins(12, 0, 12, 0)
         self.status_label = QLabel("")
+        # 关键：标签默认会把「最长的那句提示」算进窗口最小宽度，
+        # 于是状态栏一显示长文字，窗口就再也缩不回去、还会被顶出屏幕。
+        # 设成 Ignored 让布局无视它的宽度诉求，文字该省略就省略。
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.status_label.setMinimumWidth(0)
         sl.addWidget(self.status_label, 1)
 
         self.btn_sort = QToolButton()
@@ -1637,6 +1730,7 @@ class SideExplorer(QWidget):
         self.reload()
 
     def _build_tray(self) -> None:
+        self._init_closetotray()
         self.tray = QSystemTrayIcon(self._make_icon(), self)
         self.tray.setToolTip("桌面工作台（右键打开菜单）")
         # Windows 上不给 contextMenu 的话，右键事件根本不会派给 Qt
@@ -1758,7 +1852,10 @@ class SideExplorer(QWidget):
         self._update_nav_state()
 
     def _set_status(self, text: str) -> None:
-        self.status_label.setText(text)
+        self.status_label.setToolTip(text)
+        width = max(60, self.status_label.width() - 4)
+        fm = self.status_label.fontMetrics()
+        self.status_label.setText(fm.elidedText(text, Qt.ElideRight, width))
 
     def _update_nav_state(self) -> None:
         parent = os.path.dirname(self.current.rstrip("\\"))
@@ -2283,8 +2380,19 @@ class SideExplorer(QWidget):
         self._populate_main_menu(menu)
         menu.exec(QCursor.pos())
 
+    def show_main_menu_at(self, global_pos) -> None:
+        """在指定位置弹出和托盘右键一样的菜单（标题栏用）。"""
+        menu = QMenu(self)
+        self._populate_main_menu(menu)
+        menu.exec(global_pos)
+
     def _populate_main_menu(self, menu: QMenu) -> None:
         menu.clear()
+
+        # ── 别的程序：关闭按钮→托盘（放最顶上，第一眼就能看到）
+        self._build_closetotray_menu(menu)
+        self._build_hidden_menu(menu)
+        menu.addSeparator()
 
         # ── 前往
         places = menu.addMenu("前往")
@@ -2308,11 +2416,6 @@ class SideExplorer(QWidget):
         places.addAction("在系统资源管理器中打开",
                          lambda: subprocess.Popen(f'explorer "{self.current}"'))
 
-        menu.addSeparator()
-
-        # ── 窗口：收纳 / 恢复 / 吸附 / 置顶 / 宽度
-        self._build_stow_menu(menu)
-        self._build_restore_menu(menu)
         menu.addSeparator()
 
         edge_menu = menu.addMenu("吸附位置")
@@ -2413,82 +2516,179 @@ class SideExplorer(QWidget):
         self.update()
         self._set_status(f"已吸附到屏幕{'右' if edge == 'right' else '左'}侧")
 
-    # ------------------------------------------------------------------ 窗口收纳
-    def stow_windows(self, windows: list[tuple[int, str]] | None = None) -> None:
-        """收纳窗口；不传参数就收纳当前所有可见窗口。"""
-        if windows is None:
-            busy = {hwnd for hwnd, _ in self._hidden_windows}
-            windows = [(h, t) for h, t in windowtray.list_windows(int(self.winId()))
-                       if h not in busy]
-        if not windows:
-            self._set_status("没有可收纳的窗口")
-            return
+    # ------------------------------------------------------- 别的程序 关闭→托盘
+    def _init_closetotray(self) -> None:
+        from closetotray import CloseToTray
+        self._window_trays: dict[int, QSystemTrayIcon] = {}
+        self.closetotray = CloseToTray(
+            on_hide=lambda hwnd: QTimer.singleShot(
+                0, lambda h=hwnd: self._hide_target_window(h)))
+        saved = self.settings.value("closetotray_targets", [])
+        if isinstance(saved, str):
+            saved = [x for x in saved.replace(";", ",").split(",") if x.strip()]
+        for exe in saved or []:
+            self.closetotray.add_target(str(exe))
+        hook_ok = self.closetotray.install() if self.closetotray.targets else False
+        self._geo_log("CTT_INIT", targets=self.closetotray.targets, hook_ok=hook_ok,
+                      active=self.closetotray.active)
+        if self.closetotray.targets and not hook_ok:
+            self._set_status("关闭拦截没装上（可能被安全软件拦了）")
 
-        if len(windows) > 1:
-            preview = "、".join(t for _, t in windows[:3])
-            if len(windows) > 3:
-                preview += "…"
-            reply = QMessageBox.question(
-                self, "收纳窗口",
-                f"隐藏这 {len(windows)} 个窗口？\n\n{preview}\n\n"
-                "窗口会从屏幕和任务栏一并消失，但程序仍在后台正常运行，"
-                "随时可以在「⋯ → 恢复窗口」找回来。",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if reply != QMessageBox.Yes:
-                return
-
-        titles = {hwnd: title for hwnd, title in windows}
-        hidden = windowtray.hide_windows([hwnd for hwnd, _ in windows])
-        for hwnd in hidden:
-            self._hidden_windows.append((hwnd, titles.get(hwnd, "")))
-        if hidden:
-            self._set_status(f"已收纳 {len(hidden)} 个窗口，可从 ⋯ → 恢复窗口 找回")
+    def _save_closetotray(self) -> None:
+        self.settings.setValue("closetotray_targets", list(self.closetotray.targets))
+        if self.closetotray.targets:
+            self.closetotray.install()      # 重装一次，钩子可能被系统摘掉了
         else:
-            self._set_status("收纳失败，窗口可能已经关掉了")
+            self.closetotray.uninstall()
 
-    def restore_window(self, hwnd: int, title: str = "") -> None:
-        self._hidden_windows = [item for item in self._hidden_windows if item[0] != hwnd]
-        if windowtray.show_windows([hwnd]):
-            self._set_status(f"已恢复「{title}」" if title else "已恢复窗口")
+    def _build_closetotray_menu(self, menu: QMenu) -> None:
+        ctt = self.closetotray
+        sub = menu.addMenu("后台运行被关窗口")
+        sub.addAction("选择窗口…", self._pick_from_window_list)
+        sub.addSeparator()
+        if not ctt.targets:
+            act = sub.addAction("（还没添加任何程序）")
+            act.setEnabled(False)
         else:
-            self._set_status("这个窗口已经关闭了")
+            toggle = sub.addAction("暂停拦截")
+            toggle.setCheckable(True)
+            toggle.setChecked(ctt.paused)
+            toggle.triggered.connect(self._toggle_closetotray)
+            sub.addSeparator()
+            for exe in list(ctt.targets):
+                sub.addAction(f"移除  {exe}",
+                              lambda _=False, e=exe: self._remove_closetotray_target(e))
 
-    def restore_windows(self) -> None:
-        if not self._hidden_windows:
-            self._set_status("当前没有收纳中的窗口")
+    def _build_hidden_menu(self, menu: QMenu) -> None:
+        ctt = self.closetotray
+        ctt.prune()
+        if not ctt.hidden:
             return
-        shown = windowtray.show_windows([hwnd for hwnd, _ in self._hidden_windows])
-        self._hidden_windows.clear()
-        self._set_status(f"已恢复 {shown} 个窗口")
+        sub = menu.addMenu(f"已缩到托盘的窗口（{len(ctt.hidden)}）")
+        for hwnd, title in list(ctt.hidden.items()):
+            label = title if len(title) <= 26 else title[:25] + "…"
+            sub.addAction(label, lambda _=False, h=hwnd: self._restore_target_window(h))
+        sub.addSeparator()
+        sub.addAction("全部恢复", self._restore_all_targets)
 
-    # ------------------------------------------------------------------ 收纳菜单
-    def _build_stow_menu(self, menu: QMenu) -> None:
-        sub = menu.addMenu("收纳窗口")
-        busy = {hwnd for hwnd, _ in self._hidden_windows}
-        windows = [(h, t) for h, t in windowtray.list_windows(int(self.winId()))
-                   if h not in busy]
+    def _pick_from_window_list(self) -> None:
+        """列出当前打开的窗口，勾选要保护的程序。"""
+        from closetotray import list_windows
+        windows = list_windows(exclude_pid=os.getpid())
         if not windows:
-            act = sub.addAction("没有可收纳的窗口")
-            act.setEnabled(False)
+            self._set_status("没找到可以选择的窗口")
             return
-        sub.addAction(f"全部（{len(windows)}）", lambda: self.stow_windows(windows))
-        sub.addSeparator()
-        for hwnd, title in windows:
-            sub.addAction(_shorten(title),
-                          lambda _=False, h=hwnd, t=title: self.stow_windows([(h, t)]))
 
-    def _build_restore_menu(self, menu: QMenu) -> None:
-        sub = menu.addMenu("恢复窗口")
-        if not self._hidden_windows:
-            act = sub.addAction("没有收纳中的窗口")
-            act.setEnabled(False)
+        dialog = WindowPickerDialog(windows, list(self.closetotray.targets), self)
+        if dialog.exec() != QDialog.Accepted:
             return
-        sub.addAction(f"全部（{len(self._hidden_windows)}）", self.restore_windows)
-        sub.addSeparator()
-        for hwnd, title in list(self._hidden_windows):
-            label = _shorten(title) if title else f"窗口 {hwnd}"
-            sub.addAction(label,
-                          lambda _=False, h=hwnd, t=title: self.restore_window(h, t))
+
+        picked = dialog.selected_exes()
+        added = [exe for exe in picked if self.closetotray.add_target(exe)]
+        # 只处理「本次列表里出现过、但被取消勾选」的。
+        # 程序没在运行的已有目标不会出现在列表里，不能因此丢掉。
+        removed = [exe for exe in self.closetotray.targets
+                   if exe in dialog.shown_exes and exe not in picked]
+        for exe in removed:
+            self.closetotray.remove_target(exe)
+
+        if not added and not removed:
+            self._set_status("没有变化")
+            return
+
+        self._save_closetotray()
+        parts = []
+        if added:
+            parts.append("添加 " + "、".join(added))
+        if removed:
+            parts.append("移除 " + "、".join(removed))
+        self._set_status("关闭即后台运行：" + "；".join(parts))
+
+    def _remove_closetotray_target(self, exe: str) -> None:
+        if self.closetotray.remove_target(exe):
+            self._save_closetotray()
+            self._set_status(f"已移除 {exe}")
+
+    def _toggle_closetotray(self, checked: bool) -> None:
+        self.closetotray.paused = bool(checked)
+        self._set_status("关闭拦截已暂停" if checked else "关闭拦截已启用")
+
+    def _hide_target_window(self, hwnd: int) -> None:
+        if not self.closetotray.hide_window(hwnd):
+            return
+        title = self.closetotray.hidden.get(hwnd, "窗口")
+        self._add_window_tray(hwnd, title)
+        short = title if len(title) <= 20 else title[:19] + "…"
+        self._set_status(f"「{short}」已缩到托盘，单击它的托盘图标可以放回来")
+
+    def _add_window_tray(self, hwnd: int, title: str) -> None:
+        """给被隐藏的窗口在系统托盘挂一个**它自己**的图标。"""
+        existing = self._window_trays.get(hwnd)
+        if existing is not None:                 # 已经有图标了，只更新提示
+            existing.setToolTip(f"{title}\n单击显示 / 隐藏，右键更多")
+            return
+        from closetotray import exe_path_of_window
+
+        icon = QIcon()
+        exe = exe_path_of_window(hwnd)
+        if exe and os.path.isfile(exe):
+            icon = self.icon_provider.icon(QFileInfo(exe))
+        if icon.isNull():
+            icon = self._make_icon()
+
+        tray = QSystemTrayIcon(icon, self)
+        tray.setToolTip(f"{title}\n单击显示 / 隐藏，右键更多")
+        menu = QMenu(self)
+        menu.addAction("显示 / 隐藏", lambda _=False, h=hwnd: self._toggle_target_window(h))
+        menu.addAction("关闭窗口", lambda _=False, h=hwnd: self._close_target_window(h))
+        tray.setContextMenu(menu)
+        tray.activated.connect(
+            lambda reason, h=hwnd: (self._toggle_target_window(h)
+                                    if reason == QSystemTrayIcon.Trigger else None))
+        tray.show()
+        self._window_trays[hwnd] = tray
+
+    def _drop_window_tray(self, hwnd: int) -> None:
+        tray = self._window_trays.pop(hwnd, None)
+        if tray is None:
+            return
+        tray.hide()
+        # 不能在「托盘图标自己发出的信号」里直接删它（Qt 会崩），
+        # 也别 setParent(None)，交给事件循环下一拍再销毁
+        QTimer.singleShot(0, tray.deleteLater)
+
+    def _toggle_target_window(self, hwnd: int) -> None:
+        """点托盘图标：窗口可见就收回去，藏着就放出来。"""
+        self._geo_log("TOGGLE_ENTER", hwnd=hwnd)
+        if not ctypes.windll.user32.IsWindow(hwnd):
+            self._drop_window_tray(hwnd)
+            self._set_status("这个窗口已经关掉了，图标已移除")
+            return
+        visible = bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+        self._geo_log("TOGGLE_STATE", hwnd=hwnd, visible=visible)
+        if visible:
+            self._hide_target_window(hwnd)
+        else:
+            self._restore_target_window(hwnd)
+        self._geo_log("TOGGLE_DONE", hwnd=hwnd)
+
+    def _restore_target_window(self, hwnd: int) -> None:
+        ok = self.closetotray.restore_window(hwnd)
+        # 图标留着不动：下次再点它就能把窗口收回去
+        self._set_status("窗口已恢复（托盘图标保留，单击可以再收回去）" if ok
+                         else "这个窗口已经不在了")
+
+    def _close_target_window(self, hwnd: int) -> None:
+        """真把这个窗口关掉（走 WM_CLOSE，鼠标钩子不拦）。"""
+        ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
+        self.closetotray.hidden.pop(hwnd, None)
+        self._drop_window_tray(hwnd)
+        self._set_status("已关闭该窗口")
+
+    def _restore_all_targets(self) -> None:
+        count = len(self.closetotray.hidden)
+        self.closetotray.restore_all()
+        self._set_status(f"已恢复 {count} 个窗口（托盘图标保留）")
 
     def set_topmost(self, enabled: bool) -> None:
         self.topmost = bool(enabled)
@@ -2540,6 +2740,15 @@ class SideExplorer(QWidget):
         screen = QApplication.primaryScreen()
         return screen.devicePixelRatio() if screen else 1.0
 
+    def _geo_log(self, tag: str, **kw) -> None:
+        try:
+            line = tag + " " + " ".join(f"{k}={v}" for k, v in kw.items()) + "\n"
+            with open(os.path.join(os.environ.get("TEMP", "."), "geo_debug.log"),
+                      "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+
     def _sync_appbar(self) -> None:
         if self._syncing or self.appbar is None:
             return
@@ -2549,6 +2758,8 @@ class SideExplorer(QWidget):
             screen_size = primary_screen_size()
             self.appbar.width = max(1, round(self.width_logical * dpr))
             rect = self.appbar.place(screen_size)
+            self._geo_log("SYNC", logical=self.width_logical, dpr=dpr,
+                          appbar_w=self.appbar.width, screen=screen_size, rect=rect)
             if rect:
                 l, t, r, b = rect
                 self.setGeometry(round(l / dpr), round(t / dpr),
@@ -2586,13 +2797,12 @@ class SideExplorer(QWidget):
             self._screen_hooked = True
 
         screen = QApplication.primaryScreen()
-        if screen is None:
-            return
+        if screen is None or screen is getattr(self, "_screen_obj", None):
+            return                              # 同一块屏已经接过了，别重复接
+        # 换了屏就重接新的；旧屏对象可能已被销毁，不去 disconnect，
+        # 否则 PySide 会刷 "Failed to disconnect" 的 RuntimeWarning
+        self._screen_obj = screen
         for sig in (screen.geometryChanged, screen.logicalDotsPerInchChanged):
-            try:
-                sig.disconnect(self._on_screen_changed)
-            except (RuntimeError, TypeError):
-                pass
             sig.connect(self._on_screen_changed)
 
     def _on_screen_changed(self, *args) -> None:
@@ -2621,12 +2831,16 @@ class SideExplorer(QWidget):
         self._last_pos_change = now
 
         rect = self.appbar.query(primary_screen_size())
+        self._geo_log("POSCHANGED", rect=rect, appbar_w=self.appbar.width,
+                      logical=self.width_logical, dpr=self._dpr())
         if not rect:
             return
         dpr = self._dpr()
         l, t, r, b = rect
-        self.setGeometry(round(l / dpr), round(t / dpr),
-                         round((r - l) / dpr), round((b - t) / dpr))
+        # 宽度一律用 appbar 的登记值：系统的 rect 宽度可能已被改坏
+        width = max(1, round(self.appbar.width / dpr))
+        height = max(1, round((b - t) / dpr))
+        self.setGeometry(round(r / dpr) - width, round(t / dpr), width, height)
 
     def _verify_placement(self) -> None:
         """定时校验：窗口实际位置和应用栏登记的位置不一致就纠正。"""
@@ -2639,7 +2853,17 @@ class SideExplorer(QWidget):
         want = QRect(round(l / dpr), round(t / dpr),
                      round((r - l) / dpr), round((b - t) / dpr))
         if self.geometry() != want:
+            self._geo_log("VERIFY_FIX", now=self.geometry().getRect(),
+                          want=want.getRect(), appbar_rect=self.appbar.rect,
+                          dpr=dpr, min_w=self.minimumSizeHint().width(),
+                          minwidth=self.minimumWidth(),
+                          logical=self.width_logical)
             self._sync_appbar()
+
+        # 顺手清理：窗口已经被关掉的，它的托盘图标也摘掉
+        for hwnd in list(getattr(self, "_window_trays", {})):
+            if not ctypes.windll.user32.IsWindow(hwnd):
+                self._drop_window_tray(hwnd)
 
     def _apply_width(self, logical_width: int) -> None:
         width = max(self.MIN_WIDTH, min(self.MAX_WIDTH, int(logical_width)))
@@ -2671,6 +2895,9 @@ class SideExplorer(QWidget):
         self.activateWindow()
 
     def quit_app(self) -> None:
+        self._really_quit = True
+        for tray in list(getattr(self, "_window_trays", {}).values()):
+            tray.hide()
         if self.appbar is not None:
             self.appbar.remove()
         self.settings.setValue("width", self.width_logical)
@@ -2682,6 +2909,21 @@ class SideExplorer(QWidget):
         super().resizeEvent(event)
         self._reposition_handle()
         self._relayout_chips()
+
+    def _pin_in_screen(self) -> None:
+        """窗口一旦越界就按贴边规则摆回屏幕里（只动窗口，不动 AppBar 占位）。"""
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.geometry()
+        geo = self.geometry()
+        width = max(1, self.width_logical)
+        if self.edge == "right":
+            left = area.right() + 1 - width
+        else:
+            left = area.left()
+        if geo.left() != left or geo.width() != width:
+            self.setGeometry(left, area.top(), width, area.height())
 
     def _reposition_handle(self) -> None:
         """缩放条永远贴着屏幕内侧那条边（右侧吸附时在左边）。"""
@@ -2709,9 +2951,13 @@ class SideExplorer(QWidget):
                     delta = event.globalPosition().x() - self._drag_x
                     sign = -1 if self.edge == "right" else 1
                     self._apply_width(self._drag_w + sign * delta / self._dpr())
+                    self._pin_in_screen()
                 return True
             if et == QEvent.MouseButtonRelease:
                 self._drag_x = None
+                # 松手后按登记值把位置钉回去：拖动过程中 Qt 自己 resize 时
+                # 右边缘是固定的，会把窗口推到屏幕外面去
+                self._sync_appbar()
                 return True
         return super().eventFilter(obj, event)
 
@@ -2753,6 +2999,21 @@ class SideExplorer(QWidget):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        if self.appbar is not None:
-            self.appbar.remove()
-        super().closeEvent(event)
+        """点 × 不退出程序，只缩到托盘（和微信一样）。
+
+        真正退出走托盘右键菜单里的「退出」。
+        """
+        if self._really_quit or self.tray is None or not self.tray.isVisible():
+            if self.appbar is not None:
+                self.appbar.remove()
+            event.accept()
+            return
+
+        event.ignore()
+        self.hide_to_tray()
+        if not self.settings.value("tray_tip_shown", False, bool):
+            self.settings.setValue("tray_tip_shown", True)
+            self.tray.showMessage(
+                "桌面工作台",
+                "已缩到托盘，程序还在后台运行\n点托盘图标可以调回来，右键菜单里有「退出」",
+                QSystemTrayIcon.Information, 3000)

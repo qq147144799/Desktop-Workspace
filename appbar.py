@@ -115,11 +115,17 @@ class AppBar:
         # 1) 先问系统这块位置能不能用（会避开任务栏 / 其它应用栏）
         if not shell32.SHAppBarMessage(ABM_QUERYPOS, ctypes.byref(abd)):
             return None
-        # 2) 高度听系统的，宽度和贴边方向坚持自己的
+        # 2) 高度听系统的，宽度和贴边方向坚持自己的。
+        #    系统有时会把边界推到屏幕外（多屏/DPI 切换后），必须钳回来，
+        #    否则窗口会被拉宽到看不见的地方。
         if self.edge == "right":
+            abd.rc.right = min(int(abd.rc.right), screen_w)
             abd.rc.left = abd.rc.right - self.width
         else:
+            abd.rc.left = max(int(abd.rc.left), 0)
             abd.rc.right = abd.rc.left + self.width
+        abd.rc.top = max(int(abd.rc.top), 0)
+        abd.rc.bottom = min(int(abd.rc.bottom), screen_h)
         # 3) 正式占位，系统会广播工作区变化，所有最大化窗口自动收缩
         if not shell32.SHAppBarMessage(ABM_SETPOS, ctypes.byref(abd)):
             return None
@@ -140,9 +146,13 @@ class AppBar:
         if not shell32.SHAppBarMessage(ABM_QUERYPOS, ctypes.byref(abd)):
             return None
         if self.edge == "right":
+            abd.rc.right = min(int(abd.rc.right), screen_w)
             abd.rc.left = abd.rc.right - self.width
         else:
+            abd.rc.left = max(int(abd.rc.left), 0)
             abd.rc.right = abd.rc.left + self.width
+        abd.rc.top = max(int(abd.rc.top), 0)
+        abd.rc.bottom = min(int(abd.rc.bottom), screen_h)
         return (abd.rc.left, abd.rc.top, abd.rc.right, abd.rc.bottom)
 
     def set_width(self, width_px: int, screen_size: tuple[int, int] | None = None):
