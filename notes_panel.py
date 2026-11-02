@@ -20,12 +20,18 @@ from PySide6.QtWidgets import (QAbstractItemView, QDateTimeEdit, QDialog,
                                QPushButton, QStyle, QStyledItemDelegate,
                                QToolButton, QVBoxLayout, QWidget)
 
+import list_style
 import notes as nt
 import theme
 
-NOTE_ROW_H = 30
+NOTE_ROW_H = list_style.ROW_H      # 和文件列表 / 其它页签列表同一个行高
 REMIND_AREA_W = 68
 NOTE_MIME = "application/x-sideexplorer-note"
+
+
+def single_line(text: str) -> str:
+    """便签现在只支持单行；老数据里残留的换行统一显示成空格。"""
+    return " ".join(part.strip() for part in text.splitlines() if part.strip())
 
 
 def color_swatch_icon(bg: str, bar: str) -> QIcon:
@@ -157,7 +163,8 @@ class NoteDelegate(QStyledItemDelegate):
 
     def setEditorData(self, editor, index) -> None:  # noqa: N802
         note = index.data(Qt.UserRole)
-        editor.setText(note.text if note else "")
+        editor.setText(single_line(note.text if note else ""))
+        editor.selectAll()
 
     def setModelData(self, editor, model, index) -> None:  # noqa: N802
         model.setData(index, editor.text(), Qt.EditRole)
@@ -175,7 +182,7 @@ class NoteDelegate(QStyledItemDelegate):
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
-        body = rect.adjusted(7, 2, -7, -2)
+        body = list_style.body_rect(rect)
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(bg))
@@ -203,10 +210,11 @@ class NoteDelegate(QStyledItemDelegate):
         text_width = max(0, body.right() - text_left - REMIND_AREA_W)
 
         overdue = note.remind_dt is not None and note.remind_dt <= now and not note.fired
+        text = single_line(note.text or "")
         painter.setPen(QColor("#6B7280") if overdue else QColor("#1F2329"))
         painter.drawText(QRect(text_left, body.top(), text_width, body.height()),
                          Qt.AlignLeft | Qt.AlignVCenter,
-                         fm.elidedText(note.text, Qt.ElideRight, text_width))
+                         fm.elidedText(text, Qt.ElideRight, text_width))
 
         small_font = QFont(option.font)
         small_font.setPointSizeF(theme.META_FONT_PT)
@@ -575,12 +583,15 @@ class TrashDialog(QDialog):
 class NotesPanel(QWidget):
     message = Signal(str)      # 给状态栏用
 
-    def __init__(self, config, parent=None):
+    def __init__(self, config, parent=None, compact: bool = False):
         super().__init__(parent)
         self.setObjectName("Notes")
         self.config = config
+        self.compact = compact          # 嵌进工作台时不要自己的标题栏
         self.model = NoteModel(self)
         self.model.set_notes(nt.load_notes(config.value("notes", [])))
+        self._all_notes: list[nt.Note] = list(self.model.items)   # 搜索时它是真相
+        self._search_text = ""
         self.trash: list[dict] = nt.load_trash(config.value("trash_notes", []))
         self._build()
         self._refresh()
@@ -608,27 +619,40 @@ class NotesPanel(QWidget):
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
+        # 顶部留一点呼吸感，和计算器/记事本/日历/截屏四页保持一致
+        root.setContentsMargins(0, 4, 0, 0)
         root.setSpacing(0)
 
-        header = QFrame()
-        header.setObjectName("NotesHeader")
-        header.setFixedHeight(26)
-        hl = QHBoxLayout(header)
-        hl.setContentsMargins(12, 0, 8, 0)
-        hl.setSpacing(2)
+        self.count_label = None
+        if not self.compact:
+            header = QFrame()
+            header.setObjectName("NotesHeader")
+            header.setFixedHeight(26)
+            hl = QHBoxLayout(header)
+            hl.setContentsMargins(12, 0, 8, 0)
+            hl.setSpacing(2)
 
-        title = QLabel("便签")
-        title.setObjectName("NotesTitle")
-        hl.addWidget(title)
-        self.count_label = QLabel("")
-        self.count_label.setObjectName("NotesCount")
-        hl.addSpacing(6)
-        hl.addWidget(self.count_label)
-        hl.addStretch(1)
-        hl.addWidget(self._small_button("＋", "添加便签", self.focus_input))
-        hl.addWidget(self._small_button("⋯", "更多", self.show_menu))
-        root.addWidget(header)
+            title = QLabel("便签")
+            title.setObjectName("NotesTitle")
+            hl.addWidget(title)
+            self.count_label = QLabel("")
+            self.count_label.setObjectName("NotesCount")
+            hl.addSpacing(6)
+            hl.addWidget(self.count_label)
+            hl.addStretch(1)
+            hl.addWidget(self._small_button("＋", "添加便签", self.focus_input))
+            hl.addWidget(self._small_button("⋯", "更多", self.show_menu))
+            root.addWidget(header)
+
+        # 搜索条：默认藏着不占地方，Ctrl+F 叫出来
+        self.search_edit = QLineEdit()
+        self.search_edit.setObjectName("NoteSearch")
+        self.search_edit.setPlaceholderText("搜索待办…（Esc 收起）")
+        self.search_edit.setFixedHeight(26)
+        self.search_edit.setVisible(False)
+        self.search_edit.textChanged.connect(self._apply_search)
+        self.search_edit.installEventFilter(self)
+        root.addWidget(self.search_edit)
 
         self.view = NoteView(self)
         self.view.setObjectName("NoteList")
@@ -656,27 +680,64 @@ class NotesPanel(QWidget):
 
         self.input = QLineEdit()
         self.input.setObjectName("NoteInput")
-        self.input.setPlaceholderText("记一条，回车添加")
-        self.input.setFixedHeight(26)
+        self.input.setPlaceholderText("记一条待办，回车添加")
+        self.input.setFixedHeight(28)
         self.input.returnPressed.connect(self._on_input_submitted)
         root.addWidget(self.input)
 
     # ------------------------------------------------------------------ 基础
     def _save(self) -> None:
-        self.config.setValue("notes", nt.dump_notes(self.model.items))
+        if not self._search_text:              # 非搜索态：model 就是全部
+            self._all_notes = list(self.model.items)
+        self.config.setValue("notes", nt.dump_notes(self._all_notes))
         self.config.setValue("trash_notes", nt.dump_trash(self.trash))
         self._update_count()
+
+    # ------------------------------------------------------------------ 搜索
+    def toggle_search(self) -> None:
+        if self.search_edit.isVisible():
+            self.search_edit.clear()
+            self.search_edit.setVisible(False)
+            self.view.setFocus()
+            return
+        self.search_edit.setVisible(True)
+        self.search_edit.setFocus()
+        self.search_edit.selectAll()
+
+    def _apply_search(self, text: str) -> None:
+        self._search_text = text.strip()
+        if not self._search_text:
+            self.model.set_notes(self._all_notes)
+        else:
+            needle = self._search_text.lower()
+            self.model.set_notes([n for n in self._all_notes
+                                  if needle in (n.text or "").lower()])
+        self._refresh()
+        self._update_count()
+        if self._search_text:
+            count = self.model.rowCount()
+            self.message.emit(f"搜索「{self._search_text}」：{count} 条" if count
+                              else f"没找到「{self._search_text}」")
 
     def _trash_note(self, note: nt.Note) -> None:
         self.trash.insert(0, nt.make_trash_entry(note))
         del self.trash[nt.TRASH_LIMIT:]
 
     def _update_count(self) -> None:
-        total = len(self.model.items)
-        self.count_label.setText(str(total) if total else "")
+        if self.count_label is None:
+            return
+        total = len(self._all_notes)
+        if self._search_text:
+            self.count_label.setText(f"{self.model.rowCount()}/{total}")
+        else:
+            self.count_label.setText(str(total) if total else "")
 
     def _refresh(self) -> None:
         empty = self.model.rowCount() == 0
+        if self._search_text:
+            self.empty_hint.setText("没找到匹配的待办")
+        else:
+            self.empty_hint.setText("还没有待办，下面输入一行试试")
         self.empty_hint.setVisible(empty)
         if empty:
             self.empty_hint.setGeometry(self.view.viewport().rect())
@@ -701,7 +762,12 @@ class NotesPanel(QWidget):
         if not text:
             return
         self.input.clear()
-        row = self.model.add(nt.Note(text=text))
+        if self.search_edit.isVisible():       # 新增时退出搜索，好让新条目露面
+            self.search_edit.clear()
+            self.search_edit.setVisible(False)
+        note = nt.Note(text=text)
+        row = self.model.add(note)
+        self._all_notes.append(note)
         self._refresh()
         self._save()
         index = self.model.index(row, 0)
@@ -745,7 +811,7 @@ class NotesPanel(QWidget):
             menu.addAction("删除这条", self.delete_selected)
             menu.addSeparator()
 
-        menu.addAction("添加便签", self.focus_input)
+        menu.addAction("添加待办", self.focus_input)
         menu.addAction("导入 CSV…", self.import_csv)
         menu.addAction("导出 CSV…", self.export_csv)
         menu.addSeparator()
@@ -759,15 +825,19 @@ class NotesPanel(QWidget):
         return "回收站…"
 
     def show_menu(self) -> None:
+        self.show_menu_at(None)
+
+    def show_menu_at(self, anchor: QPoint | None = None) -> None:
         menu = QMenu(self)
-        menu.addAction("添加便签", self.focus_input)
+        menu.addAction("添加待办", self.focus_input)
+        menu.addAction("搜索待办（Ctrl+F）", self.toggle_search)
         menu.addSeparator()
         menu.addAction("导入 CSV…", self.import_csv)
         menu.addAction("导出 CSV…", self.export_csv)
         menu.addSeparator()
         menu.addAction(self._trash_label(), self.open_trash)
         menu.addAction("清空全部（移到回收站）", self.clear_all)
-        menu.exec(self.btn_menu_anchor())
+        menu.exec(anchor or self.btn_menu_anchor())
 
     def btn_menu_anchor(self) -> QPoint:
         buttons = self.findChildren(QToolButton, "NotesBtn")
@@ -797,6 +867,9 @@ class NotesPanel(QWidget):
         if note is not None:
             self._trash_note(note)
         self.model.remove(row)
+        if self._search_text and note is not None:
+            # 搜索态下 model 只是子集，得按对象身份从完整列表里摘掉
+            self._all_notes = [n for n in self._all_notes if n is not note]
         self._refresh()
         self._save()
         self.message.emit("已移到回收站，可从「⋯ → 回收站」恢复")
@@ -932,6 +1005,12 @@ class NotesPanel(QWidget):
 
     # ------------------------------------------------------------------ 事件
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.search_edit:
+            if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+                self.toggle_search()          # Esc 收起搜索条并清空
+                return True
+            return super().eventFilter(obj, event)
+
         if obj is self.view.viewport() and event.type() == QEvent.MouseButtonPress:
             popup = getattr(self, "remind_popup", None)
             if popup is not None:
@@ -957,3 +1036,44 @@ class NotesPanel(QWidget):
             act = menu.addAction(color_swatch_icon(bg, bar), f"{label}色")
             act.triggered.connect(lambda _=False, k=key, r=row: self._set_color(r, k))
         menu.exec(global_pos)
+
+
+# --------------------------------------------------------------------------- 工作台页
+
+class NotesPage(NotesPanel):
+    """嵌进工作台的便签页：没有自己的标题栏，动作交给容器右上角那两个按钮。"""
+
+    kind = "notes"
+    title = "待办事项"
+    primary_tip = "添加便签"
+    can_primary = True
+
+    def __init__(self, config, parent=None):
+        super().__init__(config, parent, compact=True)
+
+    def primary(self) -> None:
+        self.focus_input()
+
+    def menu(self, anchor=None) -> None:
+        point = None
+        if anchor is not None:
+            point = anchor.mapToGlobal(QPoint(0, anchor.height() + 4))
+        self.show_menu_at(point)
+
+    def activate(self) -> None:
+        self.view.viewport().update()
+
+    def deactivate(self) -> None:
+        self._save()
+
+    def handle_key(self, action: str) -> bool:
+        if action == "delete":
+            self.delete_selected()
+            return True
+        if action == "rename":
+            self.rename_selected()
+            return True
+        if action == "all":
+            self.view.selectAll()
+            return True
+        return False

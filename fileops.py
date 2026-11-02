@@ -11,6 +11,7 @@ import ctypes
 import os
 import shutil
 import struct
+import subprocess
 from ctypes import wintypes
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -182,6 +183,42 @@ def clear_files() -> None:
 
 
 # --------------------------------------------------------------------------- 操作
+
+
+def reveal_in_explorer(path: str) -> bool:
+    """在资源管理器里打开所在文件夹并选中这一项。
+
+    比 ``explorer /select,"path"`` 稳：后者靠命令行解析，资源管理器已经在跑时
+    偶尔只是切到「快速访问」而不选中，路径里带逗号更是直接解析错。这里走 Shell
+    的 SHOpenFolderAndSelectItems，是系统给「在文件夹中显示」用的正经接口。
+    """
+    full = os.path.abspath(path)
+    if not os.path.exists(full):
+        return False
+
+    try:
+        shell32.ILCreateFromPathW.argtypes = [wintypes.LPCWSTR]
+        shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+        shell32.SHOpenFolderAndSelectItems.argtypes = [
+            ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.DWORD]
+        shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+        shell32.ILFree.argtypes = [ctypes.c_void_p]
+
+        pidl = shell32.ILCreateFromPathW(full)
+        if pidl:
+            try:
+                if shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0:
+                    return True
+            finally:
+                shell32.ILFree(pidl)
+    except (OSError, AttributeError):
+        pass
+
+    try:                                  # 兜底：老办法
+        subprocess.Popen(f'explorer /select,"{full}"')
+        return True
+    except OSError:
+        return False
 
 
 def recycle(paths: list[str]) -> bool:

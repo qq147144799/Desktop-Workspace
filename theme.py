@@ -95,8 +95,20 @@ QWidget { color: {text}; font-family: "Microsoft YaHei UI", "Segoe UI"; font-siz
 #Root { background: {bg}; }
 #Header { background: {bg_header}; border-bottom: 1px solid {border}; }
 #Header QLabel#Title { font-size: 12px; font-weight: 600; color: {title}; }
+#SearchBar { background: {bg_header}; border-bottom: 1px solid {border}; }
+QLineEdit#SearchEdit {
+    border: 1px solid {input_border}; border-radius: 8px;
+    background: {bg}; padding: 0 10px; font-size: 9pt; color: {text};
+    selection-background-color: {sel_border}; selection-color: {text};
+}
+QLineEdit#SearchEdit:focus { border-color: {accent}; }
+QToolButton#SearchClose {
+    border: none; background: transparent; color: {muted}; font-size: 11px;
+}
+QToolButton#SearchClose:hover { color: {text}; }
 #Status { background: {bg_bar}; border-top: 1px solid {border}; }
 #Status QLabel { color: {dim}; font-size: 11px; }
+QLabel#StatusTime { color: {muted}; font-size: 11px; padding-left: 8px; }
 QToolButton { border: none; border-radius: 6px; color: {text2}; background: transparent; }
 QToolButton:hover { background: {btn_hover}; }
 QToolButton:pressed { background: {btn_press}; }
@@ -104,7 +116,11 @@ QToolButton#NavBtn { font-family: "Segoe UI Symbol"; font-size: 15px; color: {te
 QToolButton#NavBtn:disabled { color: {disabled}; }
 QToolButton#TitleBtn { font-family: "Segoe UI Symbol"; font-size: 13px; color: {icon}; }
 #NavBar { background: {bg_soft}; border-bottom: 1px solid {line1}; }
-QToolButton#SortBtn { color: {dim}; font-size: 11px; padding: 0 4px; border-radius: 4px; }
+QToolButton#SortBtn, QToolButton#ListMenuBtn {
+    color: {dim}; font-size: 12px; padding: 0 4px; border-radius: 4px;
+    font-family: "Segoe UI Symbol";
+}
+QToolButton#ListMenuBtn:hover { color: {accent}; }
 QToolButton#SortBtn:hover { color: {accent}; background: transparent; }
 QLineEdit#Path {
     background: {bg_header}; border: 1px solid {line2}; border-radius: 7px;
@@ -137,19 +153,27 @@ QMenu::item { padding: 6px 22px 6px 16px; border-radius: 5px; font-size: 12px; }
 QMenu::item:selected { background: {sel}; }
 QMenu::separator { height: 1px; background: {sep}; margin: 4px 6px; }
 QMenu::indicator { width: 12px; height: 12px; }
+QToolTip {
+    background: {bg}; color: {text}; border: 1px solid {divider};
+    padding: 3px 8px; font-size: 9pt;
+}
 
 #Notes { background: {bg}; }
-#NotesHeader { background: {bg_header}; border-top: 1px solid {border}; border-bottom: 1px solid {border}; }
-QLabel#NotesTitle { font-size: 11px; font-weight: 600; color: {title}; }
+#NotesHeader { background: {bg_header}; border-top: 1px solid {border}; border-bottom: 1px solid {border}; }QLabel#NotesTitle { font-size: 11px; font-weight: 600; color: {title}; }
 QLabel#NotesCount { font-size: 10px; color: {muted}; }
 QLabel#NoteEmpty { color: {placeholder}; font-size: 11px; }
 QToolButton#NotesBtn { font-family: "Segoe UI Symbol"; font-size: 12px; color: {icon}; border-radius: 5px; }
 QLineEdit#NoteInput {
     border: none; border-top: 1px solid {border}; background: {bg};
-    padding: 0 12px; font-size: 11px; color: {text};
+    padding: 0 12px; font-size: 9pt; color: {text};
     selection-background-color: {sel_border}; selection-color: {text};
 }
 QLineEdit#NoteInput:focus { background: {bg_soft}; }
+QLineEdit#NoteSearch {
+    border: none; border-bottom: 1px solid {border}; background: {bg_soft};
+    padding: 0 12px; font-size: 9pt; color: {text};
+    selection-background-color: {sel_border}; selection-color: {text};
+}
 QListView#NoteList { background: {bg}; }
 QSplitter::handle:vertical { background: {split}; height: 6px; }
 QSplitter::handle:vertical:hover { background: {split_hover}; }
@@ -173,4 +197,59 @@ QLabel#PopupBodyStrong {
     background: {sel}; border-radius: 7px; padding: 9px 11px;
     border: 1px solid {sel_border};
 }
+
+/* ---------------- 工作台（下半区的页签容器） ---------------- */
+#Workbench { background: {bg}; }
+#WorkbenchHeader {
+    background: {bg_header}; border-top: 1px solid {border};
+    border-bottom: 1px solid {border};
+}
+#WorkbenchStack { background: {bg}; }
+QToolButton#WorkbenchBtn {
+    font-family: "Segoe UI Symbol"; font-size: 12px; color: {icon};
+    border-radius: 5px; padding: 0;
+}
+QToolButton#WorkbenchBtn:hover { background: {btn_hover}; color: {text}; }
+QToolButton#WorkbenchBtn:pressed { background: {btn_press}; }
+QToolButton#WorkbenchBtn:disabled { color: {disabled}; }
+
+QLineEdit#CalcInput {
+    border: none; border-bottom: 1px solid {border};
+    background: {bg}; padding: 0 12px; font-size: 12px; color: {text};
+    selection-background-color: {sel_border}; selection-color: {text};
+}
+QLineEdit#CalcInput:focus { background: {bg_soft}; }
+QListView#CalcList { background: {bg}; }
+QListView#ShotList { background: {bg}; }
+QListView#ClipList { background: {bg}; }
+QLabel#ClipEmpty { color: {placeholder}; font-size: 11px; }
+QToolButton#SegBtn {
+    border: 1px solid {line3}; border-radius: 9px; padding: 0 10px;
+    font-size: 9pt; color: {text2}; background: {bg};
+}
+QToolButton#SegBtn:checked {
+    background: {sel}; color: {accent}; border-color: {sel_border};
+}
+
+QPlainTextEdit#PadEdit {
+    background: {bg}; border: none; padding: 8px 10px; color: {text};
+    selection-background-color: {sel_border}; selection-color: {text};
+}
+QLabel#PadMeta { color: {muted}; font-size: 10px; padding-right: 10px; }
+
+QLabel#CalTitle { font-size: 11px; font-weight: 600; color: {title}; }
+QLabel#CalCount { font-size: 10px; color: {muted}; padding-right: 4px; }
+QToolButton#CalNav {
+    font-family: "Segoe UI Symbol"; font-size: 14px; color: {icon};
+    border-radius: 5px; padding: 0;
+}
+QToolButton#CalNav:hover { background: {btn_hover}; }
+QListWidget#CalDayList {
+    background: {bg_soft}; border-top: 1px solid {border};
+    font-size: 8.6pt; color: {text2}; padding: 1px 0;
+}
+QListWidget#CalDayList::item { padding-left: 8px; }
+
+QLabel#ShotEmpty { color: {placeholder}; font-size: 11px; }
+QListView#SnapList { background: {bg}; }
 """

@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import ctypes
-import json
+import datetime
+import fnmatch
 import math
 import os
 import re
@@ -22,30 +23,35 @@ from dataclasses import dataclass
 from PySide6.QtCore import (QAbstractListModel, QEvent, QFileInfo, QMimeData,
                             QModelIndex, QObject, QPoint, QPointF, QRect, QRectF,
                             QSize, Qt, QThread, QTimer, QUrl, Signal)
-from PySide6.QtGui import (QColor, QDesktopServices, QDrag, QFont, QFontMetrics,
-                           QIcon, QKeySequence, QPainter, QPainterPath, QPen,
-                           QPixmap, QPolygonF, QShortcut)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QDialog,
+from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QDrag, QFont,
+                           QFontMetrics, QIcon, QKeySequence, QPainter,
+                           QPainterPath, QPen, QPixmap, QPolygonF, QShortcut)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog,
                                QDialogButtonBox, QFileIconProvider, QFrame,
                                QHBoxLayout, QInputDialog, QLabel, QLayout,
-                               QLineEdit, QListView, QListWidget,
+                               QKeySequenceEdit, QLineEdit, QListView, QListWidget,
                                QListWidgetItem, QMenu, QMessageBox,
-                               QProgressDialog, QPushButton, QScrollArea,
-                               QSizePolicy, QSplitter, QStyle,
-                               QStyledItemDelegate, QSystemTrayIcon, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QProgressDialog, QPushButton, QRadioButton,
+                               QScrollArea, QSizePolicy, QSpinBox, QSplitter,
+                               QStyle, QStyledItemDelegate, QSystemTrayIcon,
+                               QToolButton, QVBoxLayout, QWidget)
 
 import archive
 import fileops
+import list_style
+import shutdown_timer
+import screenshot
 import shelldrag
 import shellnew
 import theme
 from appbar import AppBar, primary_screen_size
 from config import Config
-from notes_panel import NotesPanel
+from workbench import Workbench
 
 FILE_ATTRIBUTE_HIDDEN = 0x2
-ROW_HEIGHT = 48
+ROW_HEIGHT = list_style.ROW_H    # 30px，和待办 / 计算器 / 剪切板那些列表一个高度
+ROW_ICON = 16                    # 行首图标边长（其余尺寸都在 list_style 里）
+DEFAULT_SHOT_HOTKEY = screenshot.DEFAULT_SHOT_HOTKEY
 
 # --------------------------------------------------------------------------- 数据
 
@@ -57,120 +63,9 @@ class Entry:
     is_dir: bool
     size: int
     mtime: float
-    subtitle: str = ""          # 非空时替掉「大小 · 时间」那一行
-    expr: str = ""              # 非空表示这是一条算式历史
-    result: str = ""            # 算式结果
-    note: str = ""              # 备注，显示在右侧
 
 
 _num_re = re.compile(r"(\d+)")
-
-# ---------------------------------------------------------------- 地址栏算式
-_MATH_FUNCS = {
-    "abs": abs, "round": round, "min": min, "max": max, "sum": sum,
-    "sqrt": math.sqrt, "cbrt": lambda x: x ** (1 / 3), "pow": pow,
-    "sin": math.sin, "cos": math.cos, "tan": math.tan,
-    "asin": math.asin, "acos": math.acos, "atan": math.atan,
-    "log": math.log, "log10": math.log10, "log2": math.log2,
-    "exp": math.exp, "floor": math.floor, "ceil": math.ceil,
-}
-_MATH_CONSTS = {"pi": math.pi, "e": math.e, "tau": math.tau}
-
-
-_EXPR_MARKS = set("+-*/=×÷＋－")
-
-
-def looks_like_expression(text: str) -> bool:
-    """敲进地址栏的东西像不像算式（含运算符、括号或函数名）。"""
-    text = (text or "").strip()
-    if not text:
-        return False
-    if any(ch in _EXPR_MARKS for ch in text):
-        return True
-    if "(" in text or ")" in text:
-        return True
-    lowered = text.lower()
-    return any(name in lowered for name in ("sqrt", "log", "sin", "cos", "tan", "pi"))
-
-
-def eval_expression(text: str):
-    """安全求值：只认数字、四则运算、括号、常用函数。失败返回 (None, 原因)。"""
-    import ast
-
-    expr = (text or "").strip()
-    for src, dst in (("×", "*"), ("÷", "/"), ("，", ","), ("（", "("),
-                     ("）", ")"), ("－", "-"), ("＋", "+")):
-        expr = expr.replace(src, dst)
-    expr = expr.replace("^", "**")
-    if not expr or len(expr) > 300:
-        return None, "空表达式"
-
-    try:
-        tree = ast.parse(expr, mode="eval")
-    except SyntaxError:
-        return None, "看不懂这个算式"
-
-    def walk(node):
-        if isinstance(node, ast.Expression):
-            return walk(node.body)
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
-                raise ValueError
-            return node.value
-        if isinstance(node, ast.BinOp):
-            left, right = walk(node.left), walk(node.right)
-            op = node.op
-            if isinstance(op, ast.Add):
-                return left + right
-            if isinstance(op, ast.Sub):
-                return left - right
-            if isinstance(op, ast.Mult):
-                return left * right
-            if isinstance(op, ast.Div):
-                return left / right
-            if isinstance(op, ast.FloorDiv):
-                return left // right
-            if isinstance(op, ast.Mod):
-                return left % right
-            if isinstance(op, ast.Pow):
-                if abs(right) > 512:
-                    raise ValueError
-                return left ** right
-            raise ValueError
-        if isinstance(node, ast.UnaryOp):
-            value = walk(node.operand)
-            if isinstance(node.op, ast.USub):
-                return -value
-            if isinstance(node.op, ast.UAdd):
-                return value
-            raise ValueError
-        if isinstance(node, ast.Name):
-            if node.id in _MATH_CONSTS:
-                return _MATH_CONSTS[node.id]
-            raise ValueError
-        if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name) or node.func.id not in _MATH_FUNCS:
-                raise ValueError
-            args = [walk(a) for a in node.args]
-            return _MATH_FUNCS[node.func.id](*args)
-        raise ValueError
-
-    try:
-        value = walk(tree)
-    except ZeroDivisionError:
-        return None, "除数是 0"
-    except (ValueError, TypeError, OverflowError):
-        return None, "看不懂这个算式"
-
-    if isinstance(value, complex):
-        return None, "结果是复数"
-    if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
-            return None, "结果超出范围"
-        if value.is_integer() and abs(value) < 1e15:
-            return str(int(value)), None
-        return f"{value:.10g}", None
-    return str(value), None
 
 
 def _natkey(text: str):
@@ -190,13 +85,29 @@ def human_size(num: int) -> str:
 
 
 def human_time(ts: float) -> str:
+    """列表右侧那一列：今天给时分，一年内给月/日，再往前只留年份。
+
+    ``HH:MM`` → ``MM/DD`` → ``YYYY``。精确到分钟对「两年前改的文件」没意义，
+    省下的宽度全留给文件名。
+    """
     lt = time.localtime(ts)
     now = time.localtime()
-    if (lt.tm_year, lt.tm_yday) == (now.tm_year, now.tm_yday):
+    today = datetime.date(now.tm_year, now.tm_mon, now.tm_mday)
+    day = datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday)
+    if (today - day).days <= 0:          # 今天（含时钟偏差导致的“明天”）
         return time.strftime("%H:%M", lt)
-    if lt.tm_year == now.tm_year:
-        return time.strftime("%m-%d %H:%M", lt)
-    return time.strftime("%Y-%m-%d", lt)
+    try:
+        cutoff = today.replace(year=today.year - 1)     # 去年的今天
+    except ValueError:                                  # 2 月 29 日
+        cutoff = today.replace(year=today.year - 1, day=28)
+    if day >= cutoff:
+        return time.strftime("%m/%d", lt)
+    return str(lt.tm_year)
+
+
+def human_time_full(ts: float) -> str:
+    """状态栏用：完整的年月日时分 —— 列表里省掉的精度在这里补回来。"""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
 def _volume_label(root: str) -> str:
@@ -396,13 +307,10 @@ class FileListModel(QAbstractListModel):
         if role == Qt.UserRole:
             return entry
         if role == Qt.DecorationRole:
-            if entry.expr:               # 算式历史不是文件，别给文件图标
-                return None
             return self.icon_for(entry)
         if role == Qt.ToolTipRole:
-            if entry.expr:
-                return f"{entry.expr} = {entry.result}" + (
-                    f"\n备注：{entry.note}" if entry.note else "")
+            # 不管是不是搜索结果，悬停都只给完整路径 —— 和正常浏览一致。
+            # 搜索结果的路径本身就带着子目录，不必再补一句「在 xxx 下」。
             return entry.path
         return None
 
@@ -474,38 +382,10 @@ class ItemDelegate(QStyledItemDelegate):
 
     def updateEditorGeometry(self, editor, option, index) -> None:  # noqa: N802
         rect = option.rect
-        left = rect.left() + 42
-        width = max(rect.right() - left - 8, 80)
-        editor.setGeometry(left, rect.top() + 6, width, 22)
-
-    _calc_icons: dict = {}
-
-    @classmethod
-    def calc_icon(cls, color: str) -> QPixmap:
-        """画个计算器小图标（缓存）。"""
-        cached = cls._calc_icons.get(color)
-        if cached is not None:
-            return cached
-        size, dpr = 22, 2
-        pm = QPixmap(size * dpr, size * dpr)
-        pm.setDevicePixelRatio(dpr)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        pen = QPen(QColor(color), 1.7)
-        pen.setJoinStyle(Qt.RoundJoin)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(QRectF(3.0, 1.8, 16.0, 18.4), 3.4, 3.4)
-        p.setBrush(QColor(color))
-        p.setPen(Qt.NoPen)
-        p.drawRoundedRect(QRectF(5.7, 4.5, 10.6, 4.4), 1.2, 1.2)
-        for row in range(2):
-            for col in range(3):
-                p.drawEllipse(QRectF(5.9 + col * 3.9, 11.6 + row * 3.6, 2.3, 2.3))
-        p.end()
-        cls._calc_icons[color] = pm
-        return pm
+        body = list_style.body_rect(rect)
+        left = body.left() + list_style.LEAD + ROW_ICON + list_style.GAP - 4
+        width = max(body.right() - left - 4, 80)
+        editor.setGeometry(left, rect.center().y() - 10, width, 20)
 
     def paint(self, painter: QPainter, option, index) -> None:
         entry = index.data(Qt.UserRole)
@@ -513,88 +393,196 @@ class ItemDelegate(QStyledItemDelegate):
             return
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = option.rect
+        body = list_style.paint_row(painter, option.rect, option)
 
-        if option.state & QStyle.State_Selected:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(theme.color("sel")))
-            painter.drawRoundedRect(rect.adjusted(6, 2, -6, -2), 7, 7)
-        elif option.state & QStyle.State_MouseOver:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(theme.color("hover")))
-            painter.drawRoundedRect(rect.adjusted(6, 2, -6, -2), 7, 7)
+        icon = index.data(Qt.DecorationRole)
+        if isinstance(icon, QIcon):
+            icon.paint(painter, QRect(body.left() + list_style.LEAD,
+                                      body.center().y() - ROW_ICON // 2,
+                                      ROW_ICON, ROW_ICON))
 
-        is_expr = bool(entry.expr)
-        icon_rect = QRect(rect.left() + 14, rect.top() + 13, 22, 22)
-        if is_expr:
-            painter.drawPixmap(QPoint(rect.left() + 14, rect.top() + 13),
-                               self.calc_icon(theme.color("dim")))
-        else:
-            icon = index.data(Qt.DecorationRole)
-            if isinstance(icon, QIcon):
-                icon.paint(painter, icon_rect)
+        text_left = body.left() + list_style.LEAD + ROW_ICON + list_style.GAP
+        right_edge = body.right() - list_style.PAD
 
-        text_left = rect.left() + 46
+        # 右侧灰字统一是修改时间（搜索结果也一样，和正常浏览保持一致）
+        name_font = list_style.main_font(option.font)
+        meta_font = list_style.meta_font(option.font)
+        meta = human_time(entry.mtime)
+        meta_w = list_style.width(meta_font, meta)
+        show_meta = right_edge - meta_w - list_style.META_GAP - text_left >= 50
+        name_right = (right_edge - meta_w - list_style.META_GAP) if show_meta else right_edge
 
-        note = entry.note
-        note_font = QFont(option.font)
-        note_font.setPointSizeF(theme.META_FONT_PT * 1.18)
-        fm_note = QFontMetrics(note_font)
-        note_w = 0
-        if note:
-            note_w = min(fm_note.horizontalAdvance(note), int(rect.width() * 0.36))
-
-        avail = rect.right() - text_left - 10 - (note_w + 10 if note_w else 0)
-        if avail < 20:
-            painter.restore()
-            return
-
-        # 第一行：算式（或文件名）
-        name_font = QFont(option.font)
-        name_font.setPointSizeF(theme.LIST_FONT_PT * (0.88 if is_expr else 1.0))
-        painter.setFont(name_font)
-        painter.setPen(QColor(theme.color("dim" if is_expr else "text")))
-        fm = QFontMetrics(name_font)
-        painter.drawText(QRect(text_left, rect.top() + 8, avail, 17),
-                         Qt.AlignLeft | Qt.AlignVCenter,
-                         fm.elidedText(entry.name, Qt.ElideMiddle, avail))
-
-        # 第二行：算式突出显示结果，普通文件显示大小/时间
-        if is_expr:
-            sub = entry.subtitle or f"=  {entry.result}"
-            result_font = QFont(option.font)
-            result_font.setPointSizeF(theme.LIST_FONT_PT * 0.96)
-            result_font.setBold(True)
-            painter.setFont(result_font)
-            painter.setPen(QColor(theme.color("text")))
-            fm_r = QFontMetrics(result_font)
-            painter.drawText(QRect(text_left, rect.top() + 25, avail, 18),
-                             Qt.AlignLeft | Qt.AlignVCenter,
-                             fm_r.elidedText(sub, Qt.ElideRight, avail))
-        else:
-            if entry.subtitle:
-                sub = entry.subtitle
-            elif entry.is_dir:
-                sub = "文件夹"
-            else:
-                sub = f"{human_size(entry.size)}   ·   {human_time(entry.mtime)}"
-            sub_font = QFont(option.font)
-            sub_font.setPointSizeF(theme.META_FONT_PT)
-            painter.setFont(sub_font)
-            painter.setPen(QColor(theme.color("dim")))
-            fm2 = QFontMetrics(sub_font)
-            painter.drawText(QRect(text_left, rect.top() + 26, avail, 16),
-                             Qt.AlignLeft | Qt.AlignVCenter,
-                             fm2.elidedText(sub, Qt.ElideRight, avail))
-
-        if note_w:
-            painter.setFont(note_font)
-            painter.setPen(QColor(theme.color("dim")))
-            painter.drawText(QRect(rect.right() - note_w - 10, rect.top() + 9,
-                                   note_w, 17),
-                             Qt.AlignRight | Qt.AlignVCenter,
-                             fm_note.elidedText(note, Qt.ElideRight, note_w))
+        avail = name_right - text_left
+        if avail >= 20:
+            list_style.draw(painter, QRect(text_left, body.top(), avail, body.height()),
+                            entry.name, name_font, theme.color("text"),
+                            mode=Qt.ElideMiddle)
+        if show_meta:
+            list_style.draw(painter, QRect(right_edge - meta_w, body.top(),
+                                           meta_w, body.height()),
+                            meta, meta_font, theme.color("dim"),
+                            align=Qt.AlignRight | Qt.AlignVCenter)
         painter.restore()
+
+
+
+# --------------------------------------------------------------------------- 搜索
+
+class Spinner(QWidget):
+    """搜索等待用的小转圈。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(16, 16)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(60)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def start(self) -> None:
+        self.show()
+        self._timer.start()
+        self.update()
+
+    def stop(self) -> None:
+        self._timer.stop()
+        self.hide()
+
+    def _tick(self) -> None:
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect()).adjusted(2.5, 2.5, -2.5, -2.5)
+        p.setPen(QPen(QColor(theme.color("line3")), 2))
+        p.drawArc(rect, 0, 360 * 16)
+        p.setPen(QPen(QColor(theme.color("accent")), 2))
+        p.drawArc(rect, -self._angle * 16, 110 * 16)
+        p.end()
+
+
+class SearchBar(QWidget):
+    """文件搜索条：边打边过滤当前目录，回车连子文件夹一起搜。"""
+
+    text_changed = Signal(str)
+    submitted = Signal(str)
+    closed = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SearchBar")
+        self.setFixedHeight(30)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 2, 8, 2)
+        lay.setSpacing(6)
+
+        self.edit = QLineEdit()
+        self.edit.setObjectName("SearchEdit")
+        self.edit.setPlaceholderText("搜当前文件夹；回车连子文件夹一起搜")
+        self.edit.textChanged.connect(self.text_changed)
+        self.edit.returnPressed.connect(
+            lambda: self.submitted.emit(self.edit.text().strip()))
+        self.edit.installEventFilter(self)
+        lay.addWidget(self.edit, 1)
+
+        self.spinner = Spinner(self)
+        lay.addWidget(self.spinner)
+
+        self.btn_close = QToolButton(self)
+        self.btn_close.setObjectName("SearchClose")
+        self.btn_close.setText("✕")
+        self.btn_close.setFixedSize(18, 18)
+        self.btn_close.setCursor(Qt.PointingHandCursor)
+        self.btn_close.setToolTip("关闭搜索（Esc）")
+        self.btn_close.clicked.connect(self.closed)
+        lay.addWidget(self.btn_close)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if (obj is self.edit and event.type() == QEvent.KeyPress
+                and event.key() == Qt.Key_Escape):
+            self.closed.emit()
+            return True
+        return super().eventFilter(obj, event)
+
+
+class SearchWorker(QThread):
+    """递归搜子目录，边找边分批丢回主线程 —— 一次全塞回去会把界面卡住。"""
+
+    batch = Signal(list)
+    done = Signal(int, bool)          # (找到多少, 是否因为太多被截断)
+
+    def __init__(self, root: str, needle: str, show_hidden: bool,
+                 limit: int = 3000):
+        super().__init__()
+        self.root = root
+        self.needle = needle.lower()
+        self.show_hidden = show_hidden
+        self.limit = limit
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _match(self, name: str) -> bool:
+        low = name.lower()
+        if "*" in self.needle or "?" in self.needle:
+            return fnmatch.fnmatch(low, self.needle)
+        return self.needle in low
+
+    def run(self) -> None:
+        total = 0
+        pending: list[Entry] = []
+        truncated = False
+        root = self.root
+
+        def flush() -> None:
+            nonlocal pending
+            if pending:
+                self.batch.emit(pending)
+                pending = []
+
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                if self._stop:
+                    return
+                # 回收站、系统卷信息这类进去也没意义
+                dirnames[:] = [d for d in dirnames
+                               if not d.startswith("$")
+                               and d.lower() not in ("system volume information",
+                                                     "recycle.bin")]
+                if not self.show_hidden:
+                    dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                    filenames = [f for f in filenames if not f.startswith(".")]
+                names = set(dirnames)
+
+                for name in list(dirnames) + filenames:
+                    if self._stop:
+                        return
+                    if not self._match(name):
+                        continue
+                    path = os.path.join(dirpath, name)
+                    try:
+                        stat = os.stat(path)
+                    except OSError:
+                        continue
+                    pending.append(Entry(
+                        path=path, name=name, is_dir=name in names,
+                        size=stat.st_size, mtime=stat.st_mtime))
+                    total += 1
+                    if len(pending) >= 60:
+                        flush()
+                    if total >= self.limit:
+                        truncated = True
+                        flush()
+                        self.done.emit(total, truncated)
+                        return
+        except OSError:
+            pass
+        flush()
+        self.done.emit(total, truncated)
 
 
 # --------------------------------------------------------------------------- 图标
@@ -838,6 +826,48 @@ class FileListView(QListView):
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(False)
 
+    # ------------------------------------------------------------ 鼠标
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        """在 Qt 改选中状态之前，先记下「点到的这行本来是不是唯一的选中项」。
+
+        资源管理器那条规则 —— 已选中的文件再点一次文件名就改名 —— 靠这个判断，
+        否则第一次点（选中）就会被当成第二次点。
+        """
+        if event.button() == Qt.LeftButton:
+            index = self.indexAt(event.position().toPoint())
+            rows = {i.row() for i in self.selectedIndexes()}
+            sole = bool(index.isValid() and len(rows) == 1 and index.row() in rows)
+            self.owner._press_selected = (index.row() if index.isValid() else -1, sole)
+        super().mousePressEvent(event)
+
+    # ------------------------------------------------------------ 滚轮
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        """一格滚轮只走 2 行（Qt 默认按系统的「一次滚 3 行」走 3 个文件）。"""
+        delta = event.angleDelta()
+        if event.modifiers() & (Qt.ControlModifier | Qt.ShiftModifier) or \
+                abs(delta.x()) > abs(delta.y()):
+            super().wheelEvent(event)
+            return
+
+        bar = self.verticalScrollBar()
+        if bar.maximum() <= bar.minimum():
+            event.accept()                 # 没得滚，别吃掉事件
+            return
+
+        # 触控板给的是像素级增量，原样跟随才顺滑
+        pixels = event.pixelDelta().y()
+        if pixels:
+            bar.setValue(bar.value() - pixels)
+            event.accept()
+            return
+
+        notches = delta.y() / 120.0
+        if not notches:
+            event.accept()
+            return
+        bar.setValue(bar.value() - int(round(notches * ROW_HEIGHT * 2)))
+        event.accept()
+
     # ------------------------------------------------------------ 拖出去
     def startDrag(self, supported_actions) -> None:  # noqa: N802
         rows = sorted({i.row() for i in self.selectedIndexes()})
@@ -979,36 +1009,30 @@ class HScrollArea(QScrollArea):
         event.accept()
 
 
-class WindowPickerDialog(QDialog):
-    """列出当前打开的窗口（按程序去重），勾选要「后台运行」的那些。"""
+class HotkeyDialog(QDialog):
+    """设置全局截图快捷键。"""
 
-    def __init__(self, windows: list[dict], existing: list[str], parent=None):
+    def __init__(self, current: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("选择窗口")
-        self.setMinimumWidth(420)
-        self.resize(460, 420)
+        self.setWindowTitle("设置截图快捷键")
+        self.setMinimumWidth(380)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(10)
 
-        tip = QLabel("勾选你要保护的程序：以后点它们的关闭按钮，只会缩到托盘并继续运行。")
+        tip = QLabel("按下你想要的组合键。建议带上 Ctrl / Alt / Shift，免得和正常打字冲突。")
         tip.setWordWrap(True)
         layout.addWidget(tip)
 
-        self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("输入关键字过滤…")
-        self.filter_edit.textChanged.connect(self._apply_filter)
-        layout.addWidget(self.filter_edit)
+        self.edit = QKeySequenceEdit(QKeySequence(current) if current else QKeySequence())
+        self.edit.setClearButtonEnabled(True)
+        self.edit.setMaximumSequenceLength(1)
+        layout.addWidget(self.edit)
 
-        self.list = QListWidget()
-        self.list.setSelectionMode(QAbstractItemView.NoSelection)
-        self.list.setAlternatingRowColors(True)
-        self.list.setIconSize(QSize(20, 20))
-        self.list.setWordWrap(False)
-        self.list.setTextElideMode(Qt.ElideRight)          # 长标题省略，别硬切
-        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        layout.addWidget(self.list, 1)
+        hint = QLabel("留空表示关闭这个快捷键")
+        hint.setStyleSheet("color: #808690;")
+        layout.addWidget(hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("确定")
@@ -1017,51 +1041,123 @@ class WindowPickerDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self.shown_exes: list[str] = []
-        providers = QFileIconProvider()
-        known = {e.lower() for e in existing}
-        for win in windows:
-            label = f"{win['exe']}    {win['title']}"
-            if win["count"] > 1:
-                label += f"    （{win['count']} 个窗口）"
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, win["exe"])
-            item.setToolTip(win.get("exe_path") or win["exe"])
-            path = win.get("exe_path") or ""
-            if path and os.path.isfile(path):
-                item.setIcon(providers.icon(QFileInfo(path)))
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if win["exe"] in known else Qt.Unchecked)
-            if win["exe"] in known:
-                item.setText(label + "    （已添加）")
-            self.shown_exes.append(win["exe"])
-            self.list.addItem(item)
-
-        if self.list.count() == 0:
-            empty = QListWidgetItem("（没找到可选的窗口）")
-            empty.setFlags(Qt.NoItemFlags)
-            self.list.addItem(empty)
-
-    def _apply_filter(self, text: str) -> None:
-        needle = (text or "").strip().lower()
-        for row in range(self.list.count()):
-            item = self.list.item(row)
-            hide = bool(needle) and needle not in item.text().lower()
-            item.setHidden(hide)
-
-    def selected_exes(self) -> list[str]:
-        picked = []
-        for row in range(self.list.count()):
-            item = self.list.item(row)
-            if item.flags() & Qt.ItemIsUserCheckable and item.checkState() == Qt.Checked:
-                exe = item.data(Qt.UserRole)
-                if exe:
-                    picked.append(exe)
-        return picked
+    def sequence(self) -> str:
+        return self.edit.keySequence().toString()
 
 
-STYLE = ""  # 由 theme.build_qss() 动态生成
+class ShutdownDialog(QDialog):
+    """定时关机 / 重启：选个延时，剩下的交给 Windows 自己在后台倒计时。"""
 
+    CUSTOM = 0
+    PRESETS = ((15, "15 分钟后"), (30, "30 分钟后"), (60, "1 小时后"),
+               (90, "1.5 小时后"), (120, "2 小时后"), (240, "4 小时后"))
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.changed = False
+        self.setWindowTitle("定时关机")
+        self.setMinimumWidth(390)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(10)
+
+        tip = QLabel("到点后由 Windows 自己关机 —— 关掉面板、甚至退出程序，照样执行。")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(QLabel("时间"))
+        self.preset = QComboBox()
+        for minutes, label in self.PRESETS:
+            self.preset.addItem(label, minutes)
+        self.preset.addItem("自定义…", self.CUSTOM)
+        row.addWidget(self.preset, 1)
+        self.minutes = QSpinBox()
+        self.minutes.setRange(1, 1440)
+        self.minutes.setSuffix(" 分钟")
+        self.minutes.setValue(45)
+        self.minutes.setVisible(False)
+        row.addWidget(self.minutes)
+        layout.addLayout(row)
+        self.preset.currentIndexChanged.connect(self._on_preset_changed)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(14)
+        mode_row.addWidget(QLabel("方式"))
+        self.rb_shutdown = QRadioButton("关机")
+        self.rb_restart = QRadioButton("重启")
+        if shutdown_timer.mode(config) == "restart":
+            self.rb_restart.setChecked(True)
+        else:
+            self.rb_shutdown.setChecked(True)
+        mode_row.addWidget(self.rb_shutdown)
+        mode_row.addWidget(self.rb_restart)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color: #808690;")
+        layout.addWidget(self.status)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Close)
+        box.button(QDialogButtonBox.Ok).setText("定时")
+        box.button(QDialogButtonBox.Close).setText("关闭")
+        self.btn_cancel = box.addButton("取消定时", QDialogButtonBox.ActionRole)
+        self.btn_cancel.clicked.connect(self._cancel_task)
+        box.accepted.connect(self._on_ok)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+        self._tick = QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._refresh)
+        self._tick.start()
+        self._refresh()
+
+    # ---------------------------------------------------------------- 内部
+    def _on_preset_changed(self, _index: int) -> None:
+        custom = self.preset.currentData() == self.CUSTOM
+        self.minutes.setVisible(custom)
+        if custom:
+            self.minutes.setFocus()
+
+    def seconds(self) -> int:
+        data = self.preset.currentData()
+        if data == self.CUSTOM:
+            return self.minutes.value() * 60
+        return int(data) * 60
+
+    def restart(self) -> bool:
+        return self.rb_restart.isChecked()
+
+    def _on_ok(self) -> None:
+        ok, message = shutdown_timer.schedule(self.config, self.seconds(), self.restart())
+        if not ok:
+            QMessageBox.warning(self, "定时关机", f"没排上：\n{message}")
+            return
+        self.changed = True
+        self.accept()
+
+    def _cancel_task(self) -> None:
+        ok, message = shutdown_timer.cancel(self.config)
+        self.changed = True
+        self._refresh()
+        if not ok:
+            self.status.setText(f"没有可取消的计划（{message}）")
+
+    def _refresh(self) -> None:
+        text = shutdown_timer.describe(self.config)
+        self.btn_cancel.setEnabled(bool(text))
+        if text:
+            self.status.setText(f"当前计划：{text}")
+        else:
+            self.btn_cancel.setEnabled(False)
+            if not self.status.text().startswith("没有可取消"):
+                self.status.setText("当前没有定时任务")
 
 
 class SideExplorer(QWidget):
@@ -1082,11 +1178,6 @@ class SideExplorer(QWidget):
             self.edge = "left"
         self.click_to_open = self.settings.value("click_to_open", False, bool)
         self._really_quit = False
-        self._expr_history: list[dict] = self._load_expr_history()
-        if self.settings.value("expr_history", []) != self._expr_history:
-            self._save_expr_history()      # 把旧版存成字符串的数据迁移成正常列表
-        self._expr_desc = bool(self.settings.value("expr_desc", True, bool))
-        self._calc_mode = False
         self._watcher = ArchiveWatcher(self)
         self._watcher.changed.connect(self._set_status)
         self.sort_key = str(self.settings.value("sort_key", "name"))
@@ -1099,6 +1190,15 @@ class SideExplorer(QWidget):
         self.current = ""
         self.history: list[str] = []
         self.hist_idx = -1
+        self.search_text = ""          # 搜索词
+        self.search_mode = ""          # "" 不搜 / "local" 只搜当前目录 / "deep" 连子目录
+        self._all_items: list[Entry] = []
+        self._deep_items: list[Entry] = []
+        self._data_status = ""         # 目录统计文案；有选中项时状态栏不用它
+        self._press_selected = (-1, False)   # 按下时那一行是不是本来就是唯一选中项
+        self._last_click = ("", -1, 0.0)     # (目录, 行, 时刻)：自己判双击用
+        self._pending_rename = (-1, "")      # 待改名的 (行, 路径)：等半秒确认不是双击
+        self._search_worker: SearchWorker | None = None
         self.appbar: AppBar | None = None
         self._drag_x: float | None = None
         self._drag_w = 0
@@ -1222,7 +1322,15 @@ class SideExplorer(QWidget):
         root.addWidget(self.chip_box)
         self._build_chips()
 
-        # 文件列表 + 便签（上下分区）
+        # 搜索条（默认藏着，Ctrl+F 叫出来）
+        self.search_bar = SearchBar()
+        self.search_bar.setVisible(False)
+        self.search_bar.text_changed.connect(self._on_search_text)
+        self.search_bar.submitted.connect(self._on_search_enter)
+        self.search_bar.closed.connect(self.close_search)
+        root.addWidget(self.search_bar)
+
+        # 文件列表 + 工作台（上下分区）
         self.splitter = QSplitter(Qt.Vertical)
         self.splitter.setObjectName("MainSplitter")
         self.splitter.setChildrenCollapsible(False)
@@ -1235,6 +1343,12 @@ class SideExplorer(QWidget):
 
         self.view = FileListView(self)
         self.view.setModel(self.model)
+        self.view.selectionModel().selectionChanged.connect(
+            self._on_selection_changed)
+        self._rename_timer = QTimer(self)
+        self._rename_timer.setSingleShot(True)
+        self._rename_timer.setInterval(500)          # 半秒：等双击可能性过去
+        self._rename_timer.timeout.connect(self._do_pending_rename)
         self.view.setDragEnabled(True)
         self.view.setDragDropMode(QAbstractItemView.DragDrop)
         self.view.setItemDelegate(self.delegate)
@@ -1248,7 +1362,7 @@ class SideExplorer(QWidget):
         self.view.setFrameShape(QFrame.NoFrame)
         self.view.customContextMenuRequested.connect(self._on_list_context_menu)
         self.view.activated.connect(self._on_activated)
-        self.view.doubleClicked.connect(self._on_activated)
+        self.view.doubleClicked.connect(self._on_double_clicked)
         self.view.clicked.connect(self._on_click_open)
         if self.click_to_open:
             self.view.viewport().setCursor(Qt.PointingHandCursor)
@@ -1256,16 +1370,17 @@ class SideExplorer(QWidget):
         file_area.setMinimumHeight(150)
         self.splitter.addWidget(file_area)
 
-        self.notes_panel = NotesPanel(self.settings, self)
-        self.notes_panel.setMinimumHeight(120)
-        self.notes_panel.message.connect(self._set_status)
-        self.splitter.addWidget(self.notes_panel)
+        self.workbench = Workbench(self.settings, self)
+        # 日历要放下 6 行、截屏页要放下 3 行，低于这个高度就会被裁
+        self.workbench.setMinimumHeight(196)
+        self.workbench.message.connect(self._set_status)
+        self.splitter.addWidget(self.workbench)
 
         sizes = self.settings.value("splitter_sizes", None)
         if isinstance(sizes, list) and len(sizes) == 2 and all(isinstance(v, int) for v in sizes):
-            self.splitter.setSizes([max(150, sizes[0]), max(120, sizes[1])])
+            self.splitter.setSizes([max(150, sizes[0]), max(196, sizes[1])])
         else:
-            self.splitter.setSizes([700, 210])
+            self.splitter.setSizes([680, 230])
         self.splitter.splitterMoved.connect(self._on_splitter_moved)
         root.addWidget(self.splitter, 1)
 
@@ -1282,6 +1397,22 @@ class SideExplorer(QWidget):
         self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.status_label.setMinimumWidth(0)
         sl.addWidget(self.status_label, 1)
+
+        # 完整修改时间靠右：和左边的大小/统计分开，右边缘固定在排序按钮前面
+        self.status_time = QLabel("")
+        self.status_time.setObjectName("StatusTime")
+        self.status_time.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.status_time.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        self.status_time.hide()
+        sl.addWidget(self.status_time)
+
+        self.btn_file_menu = QToolButton()
+        self.btn_file_menu.setObjectName("ListMenuBtn")
+        self.btn_file_menu.setText("☰")       # 列表铺满没有空白可右键时，也能呼出那排操作
+        self.btn_file_menu.setCursor(Qt.PointingHandCursor)
+        self.btn_file_menu.setToolTip("文件菜单：搜索 / 新建 / 粘贴 / 刷新")
+        self.btn_file_menu.clicked.connect(self.show_file_menu)
+        sl.addWidget(self.btn_file_menu)
 
         self.btn_sort = QToolButton()
         self.btn_sort.setObjectName("SortBtn")
@@ -1306,12 +1437,39 @@ class SideExplorer(QWidget):
             ("F2", self.rename_entry),
             ("Delete", self.delete_entries),
             ("F5", self.reload),
+            # Ctrl+1~5 直接切工作台的页，省得去点图标
+            ("Ctrl+1", lambda: self._show_page("notes")),
+            ("Ctrl+2", lambda: self._show_page("calendar")),
+            ("Ctrl+3", lambda: self._show_page("pad")),
+            ("Ctrl+4", lambda: self._show_page("calc")),
+            ("Ctrl+5", lambda: self._show_page("clip")),
+            ("Ctrl+6", lambda: self._show_page("shot")),
+            ("Ctrl+7", lambda: self._show_page("snap")),
         )
         for seq, slot in bindings:
             sc = QShortcut(QKeySequence(seq), self)
             sc.setContext(Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(slot)
             self._shortcuts.append(sc)
+
+        # Ctrl+F 全窗口生效：焦点在便签页就搜便签，否则搜文件
+        sc = QShortcut(QKeySequence("Ctrl+F"), self)
+        sc.setContext(Qt.WidgetWithChildrenShortcut)
+        sc.activated.connect(self._on_ctrl_f)
+        self._shortcuts.append(sc)
+
+    def _on_ctrl_f(self) -> None:
+        if self._focus_in_notes():
+            bench = getattr(self, "workbench", None)
+            page = bench.current_page() if bench is not None else None
+            toggle = getattr(page, "toggle_search", None)
+            if callable(toggle):
+                toggle()
+            return
+        self.toggle_search()
+
+    def _show_page(self, key: str) -> None:
+        self.workbench.show_page(key)
 
     # ------------------------------------------------------------------ 剪贴板
     @staticmethod
@@ -1320,14 +1478,10 @@ class SideExplorer(QWidget):
         return widget if isinstance(widget, QLineEdit) else None
 
     def _focus_in_notes(self) -> bool:
-        """焦点是否在便签区（那边的 F2/Delete 要操作便签，不是文件）。"""
+        """焦点是否在工作台里（那边的 F2/Delete 要操作便签，不是文件）。"""
         widget = QApplication.focusWidget()
-        if widget is None:
-            return False
-        panel = getattr(self, "notes_panel", None)
-        if panel is None:
-            return False
-        return widget is panel or panel.isAncestorOf(widget)
+        bench = getattr(self, "workbench", None)
+        return bench is not None and bench.contains(widget)
 
     def _on_splitter_moved(self, *_args) -> None:
         if self._splitter_timer is None:
@@ -1359,6 +1513,7 @@ class SideExplorer(QWidget):
             edit.selectAll()
             return
         if self._focus_in_notes():
+            self.workbench.handle_key("all")
             return
         self.view.selectAll()
 
@@ -1393,7 +1548,8 @@ class SideExplorer(QWidget):
             edit.del_()                  # 地址栏里照常删字符
             return
         if self._focus_in_notes():
-            self.notes_panel.delete_selected()
+            # 焦点在工作台里就交给当前页；页面不接手也不能转头去删文件
+            self.workbench.handle_key("delete")
             return
         entries = self._selected_entries()
         if not entries:
@@ -1409,7 +1565,7 @@ class SideExplorer(QWidget):
         if self._text_focus() is not None:
             return
         if self._focus_in_notes():
-            self.notes_panel.rename_selected()
+            self.workbench.handle_key("rename")
             return
         entries = self._selected_entries()
         if len(entries) != 1:
@@ -1688,6 +1844,12 @@ class SideExplorer(QWidget):
         label = SORT_LABELS.get(self.sort_key, "名称")
         self.btn_sort.setText(f"{label} {'↓' if self.sort_desc else '↑'}")
 
+    def show_file_menu(self) -> None:
+        """弹出和「右键空白处」一样的那排操作：搜索 / 新建 / 粘贴 / 刷新…"""
+        menu = QMenu(self)
+        self._build_empty_menu(menu)
+        menu.exec(self.btn_file_menu.mapToGlobal(QPoint(0, self.btn_file_menu.height())))
+
     def show_sort_menu(self) -> None:
         menu = QMenu(self)
         for key in ("name", "mtime", "size", "type"):
@@ -1730,7 +1892,7 @@ class SideExplorer(QWidget):
         self.reload()
 
     def _build_tray(self) -> None:
-        self._init_closetotray()
+        self._init_shot_hotkey()
         self.tray = QSystemTrayIcon(self._make_icon(), self)
         self.tray.setToolTip("桌面工作台（右键打开菜单）")
         # Windows 上不给 contextMenu 的话，右键事件根本不会派给 Qt
@@ -1740,6 +1902,8 @@ class SideExplorer(QWidget):
         self.tray.setContextMenu(self._tray_menu)
         self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
+        shutdown_timer.tidy(self.settings)      # 上次定时后电脑被硬关过的话，清掉旧时间
+        self._update_tray_tooltip()
 
     def _on_tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.Trigger:
@@ -1768,12 +1932,13 @@ class SideExplorer(QWidget):
         return QIcon(pm)
 
     # ------------------------------------------------------------------ 导航
-    def navigate(self, path: str, add_history: bool = True) -> None:
+    def navigate(self, path: str, add_history: bool = True) -> bool:
+        self._cancel_pending_rename()
         raw = os.path.expandvars(os.path.expanduser(str(path).strip().strip('"')))
         target = self._resolve_target(raw)
         if target is None:
             self._set_status(f"无法打开：{raw}")
-            return
+            return False
         path = target
 
         if add_history:
@@ -1783,13 +1948,15 @@ class SideExplorer(QWidget):
             self.hist_idx = len(self.history) - 1
 
         self.current = path
-        self._calc_mode = False
         self.settings.setValue("last_path", path)
         self.settings.sync()
         shown = COMPUTER_LABEL if path == COMPUTER_PATH else path
         self.path_edit.setText(shown)
         self.path_edit.setCursorPosition(len(shown))
+        if self.search_text or self.search_bar.isVisible():
+            self._reset_search_state()        # 换目录了，搜索自然作废
         self.reload()
+        return True
 
     def _resolve_target(self, path: str):
         """把路径规范成可浏览的目标：此电脑、普通目录、压缩包、或包内路径。"""
@@ -1840,22 +2007,197 @@ class SideExplorer(QWidget):
             self._update_nav_state()
             return
 
-        self.model.set_items(items)
+        self._all_items = items
+        self._apply_filter()
         self.view.scrollToTop()
-        dirs = sum(1 for i in items if i.is_dir)
-        if self.current == COMPUTER_PATH:
-            self._set_status(f"{len(items)} 个驱动器")
-        elif items:
-            self._set_status(f"{len(items)} 个项目 · {dirs} 个文件夹")
-        else:
-            self._set_status("空文件夹")
         self._update_nav_state()
 
-    def _set_status(self, text: str) -> None:
+    def _apply_filter(self) -> None:
+        """按当前搜索状态决定列表显示什么。"""
+        if self.search_mode == "deep":
+            self.model.set_items(self._deep_items)
+            return
+
+        items = self._all_items
+        needle = self.search_text.strip().lower()
+        if not needle:
+            self.model.set_items(items)
+            dirs = sum(1 for i in items if i.is_dir)
+            if self.current == COMPUTER_PATH:
+                self._set_data_status(f"{len(items)} 个驱动器")
+            elif items:
+                self._set_data_status(f"{len(items)} 个项目 · {dirs} 个文件夹")
+            else:
+                self._set_data_status("空文件夹")
+            return
+
+        if "*" in needle or "?" in needle:
+            matched = [i for i in items if fnmatch.fnmatch(i.name.lower(), needle)]
+        else:
+            matched = [i for i in items if needle in i.name.lower()]
+        self.model.set_items(matched)
+        if matched:
+            self._set_data_status(f"当前文件夹匹配 {len(matched)} 个（回车连子文件夹一起搜）")
+        else:
+            self._set_data_status(
+                f"当前文件夹没找到「{self.search_text}」（回车搜子文件夹）")
+
+    # ------------------------------------------------------------------ 搜索条
+    def toggle_search(self) -> None:
+        if self.search_bar.isVisible():
+            self.close_search()
+            return
+        self.search_bar.setVisible(True)
+        # 刚 show 出来的控件立刻 setFocus 经常没反应，等一拍再聚焦
+        QTimer.singleShot(0, self._focus_search)
+
+    def _focus_search(self) -> None:
+        self.search_bar.edit.setFocus(Qt.ShortcutFocusReason)
+        self.search_bar.edit.selectAll()
+
+    def _reset_search_state(self) -> None:
+        """把搜索状态清干净，但不重画列表（调用方自己决定什么时候刷新）。"""
+        self._stop_worker()
+        self.search_bar.spinner.stop()
+        edit = self.search_bar.edit
+        edit.blockSignals(True)
+        edit.clear()
+        edit.blockSignals(False)
+        self.search_bar.setVisible(False)
+        self.search_text = ""
+        self.search_mode = ""
+        self._deep_items = []
+
+    def close_search(self) -> None:
+        self._reset_search_state()
+        self._apply_filter()
+        self.view.setFocus()
+
+    def _on_search_text(self, text: str) -> None:
+        """边打边过滤当前目录，不发磁盘 IO。"""
+        self._stop_worker()
+        self.search_bar.spinner.stop()
+        self.search_text = text.strip()
+        self.search_mode = "local" if self.search_text else ""
+        self._deep_items = []
+        self._apply_filter()
+        self.view.scrollToTop()
+
+    def _on_search_enter(self, text: str) -> None:
+        """回车 → 连子文件夹一起搜（后台线程，转圈等）。"""
+        text = text.strip()
+        if not text or not self.current or self.current == COMPUTER_PATH:
+            return
+        self.search_text = text
+        self.search_mode = "deep"
+        self._deep_items = []
+        self._apply_filter()
+        self._start_deep_search()
+
+    def _start_deep_search(self) -> None:
+        self._stop_worker()
+        worker = SearchWorker(self.current, self.search_text, self.show_hidden)
+        worker.batch.connect(self._on_search_batch)
+        worker.done.connect(self._on_search_done)
+        self._search_worker = worker
+        self.search_bar.spinner.start()
+        self._set_status(f"正在搜索「{self.search_text}」…")
+        worker.start()
+
+    def _on_search_batch(self, items: list) -> None:
+        self._deep_items.extend(items)
+        if self.search_mode == "deep":
+            self.model.set_items(self._deep_items)
+            self._set_status(f"正在搜索…已找到 {len(self._deep_items)} 个")
+
+    def _on_search_done(self, total: int, truncated: bool) -> None:
+        self.search_bar.spinner.stop()
+        self._search_worker = None
+        if self.search_mode != "deep":
+            return
+        self._deep_items.sort(key=lambda e: (not e.is_dir, _natkey(e.name)))
+        self.model.set_items(self._deep_items)
+        if total:
+            tail = "（太多，只列前 3000 个）" if truncated else ""
+            self._set_status(f"搜索「{self.search_text}」：{total} 个结果{tail}（Esc 退出）")
+        else:
+            self._set_status(f"没找到「{self.search_text}」（Esc 退出）")
+
+    def _stop_worker(self) -> None:
+        worker = self._search_worker
+        if worker is None:
+            return
+        worker.stop()
+        worker.wait(2000)
+        self._search_worker = None
+
+    def _on_selection_changed(self, *_args) -> None:
+        self._cancel_pending_rename()
+        self._refresh_status()
+
+    def _cancel_pending_rename(self) -> None:
+        self._pending_rename = (-1, "")
+        if getattr(self, "_rename_timer", None) is not None:
+            self._rename_timer.stop()
+
+    def _do_pending_rename(self) -> None:
+        """半秒内没有第二次点击，确认不是双击，这才真正进入改名。"""
+        row, path = self._pending_rename
+        self._pending_rename = (-1, "")
+        if row < 0 or not path:
+            return
+        entry = self.model.entry_at(row)
+        if entry is None or entry.path != path:      # 列表已经变了（刷新/换目录）
+            return
+        if archive.split_path(entry.path):           # 压缩包里不支持改名
+            return
+        if self.view.currentIndex().row() != row:    # 焦点已经挪走
+            return
+        self.view.edit(self.model.index(row, 0))
+
+    def _set_data_status(self, text: str) -> None:
+        """目录统计先记下来 —— 一旦选中了文件，状态栏要让位给「选中了什么、多大」。"""
+        self._data_status = text
+        self._refresh_status()
+
+    def _selected_entries(self) -> list[Entry]:
+        model = self.view.selectionModel()
+        if model is None:
+            return []
+        rows = sorted({index.row() for index in model.selectedIndexes()})
+        return [e for e in (self.model.entry_at(r) for r in rows) if e is not None]
+
+    def _refresh_status(self) -> None:
+        entries = self._selected_entries()
+        if not entries:
+            self._set_status(self._data_status)
+            return
+        if len(entries) == 1:                    # 单选：大小在左，完整时间靠右
+            entry = entries[0]
+            size = "文件夹" if entry.is_dir else human_size(entry.size)
+            self._set_status(size, human_time_full(entry.mtime))
+            return
+        total = sum(e.size for e in entries if not e.is_dir)
+        dirs = sum(1 for e in entries if e.is_dir)
+        parts = [f"已选 {len(entries)} 项"]
+        if total:
+            parts.append(f"共 {human_size(total)}")
+        if dirs:
+            parts.append(f"{dirs} 个文件夹")
+        self._set_status(" · ".join(parts))
+
+    def _set_status(self, text: str, time_text: str = "") -> None:
         self.status_label.setToolTip(text)
         width = max(60, self.status_label.width() - 4)
         fm = self.status_label.fontMetrics()
         self.status_label.setText(fm.elidedText(text, Qt.ElideRight, width))
+
+        # 右侧那一列只在选中单个文件时有内容，其余状态自动收起
+        label = getattr(self, "status_time", None)
+        if label is not None:
+            label.setText(time_text)
+            label.setToolTip(time_text)
+            label.setVisible(bool(time_text))
 
     def _update_nav_state(self) -> None:
         parent = os.path.dirname(self.current.rstrip("\\"))
@@ -2002,122 +2344,68 @@ class SideExplorer(QWidget):
 
     def _on_path_entered(self) -> None:
         text = self.path_edit.text().strip()
-        # 先按路径处理：真实存在的路径优先，不会被当成算式
-        if text and os.path.exists(text):
-            self.navigate(text)
-            self.view.setFocus()
-            return
-
-        # 含 + - * / = 这类符号就当算式，进计算界面
-        if looks_like_expression(text):
-            result, _error = eval_expression(text)
-            if result is not None:
-                self._show_expression(text, result)
-            else:
-                self._enter_calc_mode()
-            self.path_edit.clear()          # 地址栏清空，方便接着算下一个
-            self.view.setFocus()
-            return
-
-        self.navigate(text)          # 既不是路径也不是算式，交给 navigate 去提示
+        if text:
+            self.navigate(text)          # 不是目录就在状态栏提示「无法打开」
         self.view.setFocus()
 
-    def _enter_calc_mode(self) -> None:
-        """只把历史铺出来，不新增记录。"""
-        self._calc_mode = True
-        if self._expr_history:
-            self._render_expr_history()
-        else:
-            self.model.set_items([])
-        self._set_status("算式模式：输入算式按回车计算，按 ↑ 回文件列表")
-
-    # ------------------------------------------------------------ 算式历史
-    def _load_expr_history(self) -> list[dict]:
-        # 配置层自己会做 JSON 序列化，这里直接拿对象就行
-        data = self.settings.value("expr_history", [])
-        if isinstance(data, str):
-            # 兼容早期版本存成字符串的那批数据
-            try:
-                data = json.loads(data)
-            except (TypeError, ValueError):
-                return []
-        if not isinstance(data, list):
-            return []
-        # 复制成新 dict：否则和配置里那份是同一个对象，
-        # 改备注时 setValue 的「值没变就跳过」会误判，导致根本没写盘
-        return [{**d} for d in data
-                if isinstance(d, dict) and d.get("expr") and d.get("result")][:60]
-
-    def _save_expr_history(self) -> None:
-        # 传副本：配置层直接持有这个 list，共享对象会导致后面的修改被判成「没变化」
-        self.settings.setValue("expr_history", [dict(r) for r in self._expr_history])
-
-    def _show_expression(self, expr: str, result: str) -> None:
-        """记下这条算式，然后把整个历史列表铺到浏览区。"""
-        self._expr_history = [r for r in self._expr_history
-                              if not (r["expr"] == expr and r["result"] == result)]
-        self._expr_history.insert(0, {"expr": expr, "result": result})
-        del self._expr_history[60:]
-        self._calc_mode = True
-        self._save_expr_history()
-        self._render_expr_history()
-        self._set_status(f"{expr} = {result}    （按 ↑ 或点地址栏回文件列表）")
-
-    def _render_expr_history(self) -> None:
-        records = list(self._expr_history)
-        if not self._expr_desc:
-            records.reverse()
-        items = [Entry(path="", name=r["expr"], is_dir=False, size=0, mtime=0.0,
-                       subtitle=f"=  {r['result']}", expr=r["expr"],
-                       result=r["result"], note=r.get("note", ""))
-                 for r in records]
-        self.model.set_items(items)
-
-    def _sort_expr(self, newest_first: bool) -> None:
-        self._expr_desc = newest_first
-        self.settings.setValue("expr_desc", newest_first)
-        self._render_expr_history()
-        self._set_status("已按" + ("倒序（新的在上）" if newest_first else "顺序（旧的在上）"))
-
-    def _edit_expr_note(self, expr: str, result: str) -> None:
-        record = next((r for r in self._expr_history
-                       if r["expr"] == expr and r["result"] == result), None)
-        if record is None:
-            return
-        text, ok = QInputDialog.getText(self, "备注", "给这条结果加个备注：",
-                                        text=record.get("note", ""))
-        if not ok:
-            return
-        note = text.strip()
-        if note:
-            record["note"] = note
-        else:
-            record.pop("note", None)
-        self._save_expr_history()
-        self._render_expr_history()
-        self._set_status("备注已保存" if note else "备注已清除")
-
-    def _delete_expr_record(self, expr: str, result: str) -> None:
-        self._expr_history = [r for r in self._expr_history
-                              if not (r["expr"] == expr and r["result"] == result)]
-        self._save_expr_history()
-        if self._expr_history:
-            self._render_expr_history()
-            self._set_status("已删除这条记录")
-        else:
-            self._set_status("已删除最后一条记录")
-            self.navigate(self.current)
-
-    def _clear_expr_history(self) -> None:
-        self._expr_history.clear()
-        self._save_expr_history()
-        self.navigate(self.current)
-        self._set_status("已清空算式记录")
-
     # ------------------------------------------------------------------ 交互
+    def _on_double_clicked(self, index: QModelIndex) -> None:
+        self._cancel_pending_rename()
+        self._on_activated(index)            # Qt 在「先点 A 再双击 B」时不发这个信号，
+                                             # 所以打开与否不能只指望它，见 _on_click_open
+
     def _on_click_open(self, index: QModelIndex) -> None:
-        if self.click_to_open and index.isValid():
+        """单击的归属，按顺序判：双击打开 > 已选中再点名字改名 > 单击打开。"""
+        if not index.isValid():
+            return
+        # 半秒内再点同一个文件名 → 就是双击，打开（比系统的双击间隔宽，和等待窗口一致）
+        pending_row, _pending_path = self._pending_rename
+        if pending_row >= 0 and index.row() == pending_row and self._on_name_area(index):
+            self._cancel_pending_rename()
             self._on_activated(index)
+            return
+
+        now = time.monotonic()
+        key = (self.current, index.row())
+        interval = QApplication.doubleClickInterval() / 1000
+        is_double = (key[0] == self._last_click[0]
+                     and key[1] == self._last_click[1]
+                     and now - self._last_click[2] < interval)
+        self._last_click = (key[0], key[1], now)
+
+        if is_double:                        # 两下间隔很短 → 打开，不改名
+            self._cancel_pending_rename()
+            self._on_activated(index)
+            return
+        # 已是唯一选中项，再点一次文件名 → 半秒后改名；
+        # 这半秒里再点一下就是双击（上面那个分支），打开文件
+        row, was_sole = self._press_selected
+        if was_sole and row == index.row() and self._on_name_area(index):
+            entry = self.model.entry_at(index.row())
+            if entry is None or not entry.path:
+                return
+            self._pending_rename = (index.row(), entry.path)
+            self._rename_timer.start()
+            return
+        self._cancel_pending_rename()
+        if self.click_to_open:
+            self._on_activated(index)
+
+    def _on_name_area(self, index: QModelIndex) -> bool:
+        """光标是不是落在「文件名」那一截上（图标、时间、右侧空白都不算）。"""
+        entry = self.model.entry_at(index.row())
+        if entry is None or not entry.path:
+            return False
+        rect = self.view.visualRect(index)
+        pos = self.view.viewport().mapFromGlobal(QCursor.pos())
+        if not rect.contains(pos):
+            return False
+        body = list_style.body_rect(rect)
+        left = body.left() + list_style.LEAD + ROW_ICON
+        meta_font = list_style.meta_font(self.view.font())
+        meta_w = list_style.width(meta_font, human_time(entry.mtime))   # 列表画的就是时间
+        right = body.right() - list_style.PAD - meta_w - list_style.META_GAP
+        return left <= pos.x() <= right
 
     def _on_activated(self, index: QModelIndex) -> None:
         # activated 与 doubleClicked 可能同时到达，做一次去抖，避免文件被打开两次
@@ -2129,9 +2417,6 @@ class SideExplorer(QWidget):
 
         entry = self.model.entry_at(index.row())
         if entry is None:
-            return
-        if entry.expr:                      # 算式历史：双击把结果填回地址栏
-            self._fill_address(entry.result)
             return
         if not entry.path:
             return
@@ -2177,23 +2462,20 @@ class SideExplorer(QWidget):
         return len(text) == 2 and text[1] == ":"
 
     def _name_hit(self, pos: QPoint):
-        """只有点在图标或文件名那一块才算命中，名称右边的空白不算——和资源管理器一致。"""
+        """点到某一行就是选中它；但右侧时间那一列按「空白」处理（右键弹背景菜单）。"""
         index = self.view.indexAt(pos)
         if not index.isValid():
             return None
         entry = self.model.entry_at(index.row())
-        if entry is None or (not entry.path and not entry.expr):
+        if entry is None or not entry.path:
             return None
         rect = self.view.visualRect(index)
-        font = QFont(self.view.font())
-        font.setPointSizeF(theme.LIST_FONT_PT)
-        fm = QFontMetrics(font)
-        text_left = rect.left() + 46          # 和 ItemDelegate.paint 保持一致
-        avail = max(rect.right() - text_left - 10, 0)
-        shown = fm.elidedText(entry.name, Qt.ElideMiddle, avail)
-        name_right = text_left + fm.horizontalAdvance(shown)
-        if pos.x() > name_right + 10:
-            return None
+        body = list_style.body_rect(rect)
+        meta_font = list_style.meta_font(self.view.font())
+        meta = human_time(entry.mtime)
+        meta_w = list_style.width(meta_font, meta)
+        if pos.x() >= body.right() - list_style.PAD - meta_w:
+            return None                     # 点在时间列上 → 和右键空白一样
         return index, entry
 
     def _on_list_context_menu(self, pos: QPoint, dry_run: bool = False):
@@ -2213,15 +2495,26 @@ class SideExplorer(QWidget):
                 # 右键一个没选中的条目：先选中它，再弹它的专属菜单
                 self.view.setCurrentIndex(index)
                 entries = [entry]
-            if entry.expr:                       # 算式历史
-                self._build_history_menu(menu, entry)
-            else:
-                self._build_entry_menu(menu, entries)
+            self._build_entry_menu(menu, entries)
 
         if dry_run:
             return menu
         menu.exec(self.view.viewport().mapToGlobal(pos))
         return None
+
+    def _reveal_path(self, path: str, is_dir: bool) -> None:
+        """在资源管理器里定位并选中；压缩包内的虚拟路径定位不了。"""
+        if not os.path.exists(path):
+            self._set_status("压缩包里的项目没法在资源管理器中定位")
+            return
+        if is_dir:
+            try:
+                subprocess.Popen(f'explorer "{path}"')
+            except OSError:
+                self._set_status("打不开所在文件夹")
+            return
+        if not fileops.reveal_in_explorer(path):
+            self._set_status("打不开所在文件夹")
 
     def _add_paste_action(self, menu: QMenu, target_dir: str) -> None:
         """剪贴板里有文件才显示粘贴，粘到 target_dir。"""
@@ -2229,28 +2522,6 @@ class SideExplorer(QWidget):
             return
         menu.addAction("粘贴            Ctrl+V",
                        lambda d=target_dir: self.paste_into_dir(d))
-
-    def _fill_address(self, text: str) -> None:
-        """在地址栏光标处插入内容，原有文字保留，插完不选中。"""
-        self.path_edit.setFocus()
-        pos = self.path_edit.cursorPosition()
-        self.path_edit.insert(text)
-        self.path_edit.setCursorPosition(pos + len(text))
-
-    def _build_history_menu(self, menu: QMenu, entry: Entry) -> None:
-        expr, result = entry.expr, entry.result
-        menu.addAction("填回计算结果", lambda: self._fill_address(result))
-        menu.addAction("填回表达式", lambda: self._fill_address(expr))
-        menu.addSeparator()
-        menu.addAction("备注…" if not entry.note else "修改备注…",
-                       lambda: self._edit_expr_note(expr, result))
-        menu.addSeparator()
-        menu.addAction("复制结果", lambda: QApplication.clipboard().setText(result))
-        menu.addAction("复制表达式", lambda: QApplication.clipboard().setText(expr))
-        menu.addSeparator()
-        menu.addAction("删除这条记录",
-                       lambda: self._delete_expr_record(expr, result))
-        menu.addAction("清空全部记录", self._clear_expr_history)
 
     def _build_entry_menu(self, menu: QMenu, entries: list[Entry]) -> None:
         single = entries[0] if len(entries) == 1 else None
@@ -2261,8 +2532,7 @@ class SideExplorer(QWidget):
             target_path, target_is_dir = single.path, single.is_dir
             menu.addAction(
                 "在资源管理器中显示",
-                lambda p=target_path, d=target_is_dir: subprocess.Popen(
-                    f'explorer "{p}"' if d else f'explorer /select,"{p}"'))
+                lambda p=target_path, d=target_is_dir: self._reveal_path(p, d))
 
         # 盘符根目录：只保留安全的几项，避免误删整个盘
         if drive_root:
@@ -2306,14 +2576,9 @@ class SideExplorer(QWidget):
                                "\n".join(e.path for e in entries)))
 
     def _build_empty_menu(self, menu: QMenu) -> None:
-        if self._calc_mode:                 # 算式界面：只管排序和清空
-            menu.addAction("顺序显示", lambda: self._sort_expr(False))
-            menu.addAction("倒序显示", lambda: self._sort_expr(True))
-            menu.addSeparator()
-            menu.addAction("清空地址栏",
-                           lambda: (self.path_edit.clear(),
-                                    self.path_edit.setFocus()))
-            return
+        # 搜索放最前：找文件是第一诉求
+        menu.addAction("搜索            Ctrl+F", self.toggle_search)
+        menu.addSeparator()
         # 粘贴（有剪贴板内容才显示）放最前，复制当前路径放最后
         if fileops.get_files()[0]:
             menu.addAction("粘贴            Ctrl+V", self.paste_entries)
@@ -2386,13 +2651,85 @@ class SideExplorer(QWidget):
         self._populate_main_menu(menu)
         menu.exec(global_pos)
 
+    # ------------------------------------------------------------ 区域截图
+    def start_region_shot(self) -> None:
+        """框选截图。面板不隐藏——想截哪里截哪里。"""
+        import screenshot
+
+        if screenshot.has_active_shot():
+            return
+        try:
+            screenshot.start_region_shot(default_dir=self.current,
+                                         on_message=self._set_status)
+        except Exception as exc:
+            self._set_status(f"截图失败：{exc}")
+
+    def _init_shot_hotkey(self) -> None:
+        from hotkey import HotkeyHook
+
+        self.shot_hook = HotkeyHook(self.start_region_shot)
+        seq = self.settings.value("shot_hotkey", DEFAULT_SHOT_HOTKEY, str)
+        if seq and not self.shot_hook.set_sequence(seq):
+            self._set_status(f"截图快捷键 {seq} 没注册上，可能被别的程序占了")
+
+    def _shot_hotkey_text(self) -> str:
+        return self.shot_hook.sequence or "（未设置）"
+
+    def _edit_shot_hotkey(self) -> None:
+        from hotkey import is_safe, parse
+
+        dialog = HotkeyDialog(self.shot_hook.sequence, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        seq = dialog.sequence()
+        if seq:
+            if parse(seq)[1] is None:
+                QMessageBox.warning(self, "快捷键", "认不出这个组合，换一个试试。")
+                return
+            if not is_safe(seq):
+                QMessageBox.warning(
+                    self, "快捷键",
+                    "这个组合太容易误触发：\n请带上 Ctrl / Alt / Shift / Win，"
+                    "或者用 F1～F12。")
+                return
+
+        self.settings.setValue("shot_hotkey", seq)
+        ok = self.shot_hook.set_sequence(seq)
+        if seq and not ok:
+            self._set_status(f"截图快捷键 {seq} 没注册上，可能被别的程序占了")
+        elif seq:
+            self._set_status(f"截图快捷键已设为 {seq}")
+        else:
+            self._set_status("截图快捷键已关闭")
+
+    def _open_shutdown_timer(self) -> None:
+        dialog = ShutdownDialog(self.settings, self)
+        dialog.exec()
+        if dialog.changed:
+            if shutdown_timer.is_pending(self.settings):
+                self._set_status(f"定时已设：{shutdown_timer.describe(self.settings)}")
+            else:
+                self._set_status("定时关机已取消")
+        self._update_tray_tooltip()
+
+    def _cancel_shutdown_task(self) -> None:
+        ok, message = shutdown_timer.cancel(self.settings)
+        if ok:
+            self._set_status("定时关机已取消")
+        else:
+            self._set_status(f"没有可取消的定时关机（{message}）")
+        self._update_tray_tooltip()
+
+    def _update_tray_tooltip(self) -> None:
+        tray = getattr(self, "tray", None)
+        if tray is None:
+            return
+        text = shutdown_timer.describe(self.settings)
+        tray.setToolTip(f"桌面工作台\n{text}" if text else "桌面工作台（右键打开菜单）")
+
     def _populate_main_menu(self, menu: QMenu) -> None:
         menu.clear()
-
-        # ── 别的程序：关闭按钮→托盘（放最顶上，第一眼就能看到）
-        self._build_closetotray_menu(menu)
-        self._build_hidden_menu(menu)
-        menu.addSeparator()
+        self._update_tray_tooltip()
 
         # ── 前往
         places = menu.addMenu("前往")
@@ -2416,6 +2753,13 @@ class SideExplorer(QWidget):
         places.addAction("在系统资源管理器中打开",
                          lambda: subprocess.Popen(f'explorer "{self.current}"'))
 
+        menu.addSeparator()
+
+        # ── 截图
+        shot = menu.addMenu("截屏")
+        shot.addAction(f"区域截图            {self._shot_hotkey_text()}",
+                       self.start_region_shot)
+        shot.addAction("设置快捷键…", self._edit_shot_hotkey)
         menu.addSeparator()
 
         edge_menu = menu.addMenu("吸附位置")
@@ -2465,6 +2809,14 @@ class SideExplorer(QWidget):
         act_boot.setChecked(self._is_autostart())
         act_boot.triggered.connect(self._toggle_autostart)
 
+        left = shutdown_timer.remaining(self.settings)
+        if left > 0:
+            menu.addAction(f"定时关机（{shutdown_timer.clock(left)} 后执行）…",
+                           self._open_shutdown_timer)
+            menu.addAction("取消定时关机", self._cancel_shutdown_task)
+        else:
+            menu.addAction("定时关机…", self._open_shutdown_timer)
+
         menu.addAction("显示 / 隐藏面板", self.toggle_visible)
         menu.addSeparator()
         menu.addAction("退出", self.quit_app)
@@ -2492,7 +2844,7 @@ class SideExplorer(QWidget):
         self.setStyleSheet(theme.build_qss())
         self._refresh_icons()
         self.view.viewport().update()
-        self.notes_panel.refresh_theme()
+        self.workbench.refresh_theme()
         self.update()
         self._set_status(f"已切换到「{theme.PALETTES[key]['label']}」主题")
 
@@ -2515,180 +2867,6 @@ class SideExplorer(QWidget):
         self._reposition_handle()
         self.update()
         self._set_status(f"已吸附到屏幕{'右' if edge == 'right' else '左'}侧")
-
-    # ------------------------------------------------------- 别的程序 关闭→托盘
-    def _init_closetotray(self) -> None:
-        from closetotray import CloseToTray
-        self._window_trays: dict[int, QSystemTrayIcon] = {}
-        self.closetotray = CloseToTray(
-            on_hide=lambda hwnd: QTimer.singleShot(
-                0, lambda h=hwnd: self._hide_target_window(h)))
-        saved = self.settings.value("closetotray_targets", [])
-        if isinstance(saved, str):
-            saved = [x for x in saved.replace(";", ",").split(",") if x.strip()]
-        for exe in saved or []:
-            self.closetotray.add_target(str(exe))
-        hook_ok = self.closetotray.install() if self.closetotray.targets else False
-        self._geo_log("CTT_INIT", targets=self.closetotray.targets, hook_ok=hook_ok,
-                      active=self.closetotray.active)
-        if self.closetotray.targets and not hook_ok:
-            self._set_status("关闭拦截没装上（可能被安全软件拦了）")
-
-    def _save_closetotray(self) -> None:
-        self.settings.setValue("closetotray_targets", list(self.closetotray.targets))
-        if self.closetotray.targets:
-            self.closetotray.install()      # 重装一次，钩子可能被系统摘掉了
-        else:
-            self.closetotray.uninstall()
-
-    def _build_closetotray_menu(self, menu: QMenu) -> None:
-        ctt = self.closetotray
-        sub = menu.addMenu("后台运行被关窗口")
-        sub.addAction("选择窗口…", self._pick_from_window_list)
-        sub.addSeparator()
-        if not ctt.targets:
-            act = sub.addAction("（还没添加任何程序）")
-            act.setEnabled(False)
-        else:
-            toggle = sub.addAction("暂停拦截")
-            toggle.setCheckable(True)
-            toggle.setChecked(ctt.paused)
-            toggle.triggered.connect(self._toggle_closetotray)
-            sub.addSeparator()
-            for exe in list(ctt.targets):
-                sub.addAction(f"移除  {exe}",
-                              lambda _=False, e=exe: self._remove_closetotray_target(e))
-
-    def _build_hidden_menu(self, menu: QMenu) -> None:
-        ctt = self.closetotray
-        ctt.prune()
-        if not ctt.hidden:
-            return
-        sub = menu.addMenu(f"已缩到托盘的窗口（{len(ctt.hidden)}）")
-        for hwnd, title in list(ctt.hidden.items()):
-            label = title if len(title) <= 26 else title[:25] + "…"
-            sub.addAction(label, lambda _=False, h=hwnd: self._restore_target_window(h))
-        sub.addSeparator()
-        sub.addAction("全部恢复", self._restore_all_targets)
-
-    def _pick_from_window_list(self) -> None:
-        """列出当前打开的窗口，勾选要保护的程序。"""
-        from closetotray import list_windows
-        windows = list_windows(exclude_pid=os.getpid())
-        if not windows:
-            self._set_status("没找到可以选择的窗口")
-            return
-
-        dialog = WindowPickerDialog(windows, list(self.closetotray.targets), self)
-        if dialog.exec() != QDialog.Accepted:
-            return
-
-        picked = dialog.selected_exes()
-        added = [exe for exe in picked if self.closetotray.add_target(exe)]
-        # 只处理「本次列表里出现过、但被取消勾选」的。
-        # 程序没在运行的已有目标不会出现在列表里，不能因此丢掉。
-        removed = [exe for exe in self.closetotray.targets
-                   if exe in dialog.shown_exes and exe not in picked]
-        for exe in removed:
-            self.closetotray.remove_target(exe)
-
-        if not added and not removed:
-            self._set_status("没有变化")
-            return
-
-        self._save_closetotray()
-        parts = []
-        if added:
-            parts.append("添加 " + "、".join(added))
-        if removed:
-            parts.append("移除 " + "、".join(removed))
-        self._set_status("关闭即后台运行：" + "；".join(parts))
-
-    def _remove_closetotray_target(self, exe: str) -> None:
-        if self.closetotray.remove_target(exe):
-            self._save_closetotray()
-            self._set_status(f"已移除 {exe}")
-
-    def _toggle_closetotray(self, checked: bool) -> None:
-        self.closetotray.paused = bool(checked)
-        self._set_status("关闭拦截已暂停" if checked else "关闭拦截已启用")
-
-    def _hide_target_window(self, hwnd: int) -> None:
-        if not self.closetotray.hide_window(hwnd):
-            return
-        title = self.closetotray.hidden.get(hwnd, "窗口")
-        self._add_window_tray(hwnd, title)
-        short = title if len(title) <= 20 else title[:19] + "…"
-        self._set_status(f"「{short}」已缩到托盘，单击它的托盘图标可以放回来")
-
-    def _add_window_tray(self, hwnd: int, title: str) -> None:
-        """给被隐藏的窗口在系统托盘挂一个**它自己**的图标。"""
-        existing = self._window_trays.get(hwnd)
-        if existing is not None:                 # 已经有图标了，只更新提示
-            existing.setToolTip(f"{title}\n单击显示 / 隐藏，右键更多")
-            return
-        from closetotray import exe_path_of_window
-
-        icon = QIcon()
-        exe = exe_path_of_window(hwnd)
-        if exe and os.path.isfile(exe):
-            icon = self.icon_provider.icon(QFileInfo(exe))
-        if icon.isNull():
-            icon = self._make_icon()
-
-        tray = QSystemTrayIcon(icon, self)
-        tray.setToolTip(f"{title}\n单击显示 / 隐藏，右键更多")
-        menu = QMenu(self)
-        menu.addAction("显示 / 隐藏", lambda _=False, h=hwnd: self._toggle_target_window(h))
-        menu.addAction("关闭窗口", lambda _=False, h=hwnd: self._close_target_window(h))
-        tray.setContextMenu(menu)
-        tray.activated.connect(
-            lambda reason, h=hwnd: (self._toggle_target_window(h)
-                                    if reason == QSystemTrayIcon.Trigger else None))
-        tray.show()
-        self._window_trays[hwnd] = tray
-
-    def _drop_window_tray(self, hwnd: int) -> None:
-        tray = self._window_trays.pop(hwnd, None)
-        if tray is None:
-            return
-        tray.hide()
-        # 不能在「托盘图标自己发出的信号」里直接删它（Qt 会崩），
-        # 也别 setParent(None)，交给事件循环下一拍再销毁
-        QTimer.singleShot(0, tray.deleteLater)
-
-    def _toggle_target_window(self, hwnd: int) -> None:
-        """点托盘图标：窗口可见就收回去，藏着就放出来。"""
-        self._geo_log("TOGGLE_ENTER", hwnd=hwnd)
-        if not ctypes.windll.user32.IsWindow(hwnd):
-            self._drop_window_tray(hwnd)
-            self._set_status("这个窗口已经关掉了，图标已移除")
-            return
-        visible = bool(ctypes.windll.user32.IsWindowVisible(hwnd))
-        self._geo_log("TOGGLE_STATE", hwnd=hwnd, visible=visible)
-        if visible:
-            self._hide_target_window(hwnd)
-        else:
-            self._restore_target_window(hwnd)
-        self._geo_log("TOGGLE_DONE", hwnd=hwnd)
-
-    def _restore_target_window(self, hwnd: int) -> None:
-        ok = self.closetotray.restore_window(hwnd)
-        # 图标留着不动：下次再点它就能把窗口收回去
-        self._set_status("窗口已恢复（托盘图标保留，单击可以再收回去）" if ok
-                         else "这个窗口已经不在了")
-
-    def _close_target_window(self, hwnd: int) -> None:
-        """真把这个窗口关掉（走 WM_CLOSE，鼠标钩子不拦）。"""
-        ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)
-        self.closetotray.hidden.pop(hwnd, None)
-        self._drop_window_tray(hwnd)
-        self._set_status("已关闭该窗口")
-
-    def _restore_all_targets(self) -> None:
-        count = len(self.closetotray.hidden)
-        self.closetotray.restore_all()
-        self._set_status(f"已恢复 {count} 个窗口（托盘图标保留）")
 
     def set_topmost(self, enabled: bool) -> None:
         self.topmost = bool(enabled)
@@ -2860,11 +3038,6 @@ class SideExplorer(QWidget):
                           logical=self.width_logical)
             self._sync_appbar()
 
-        # 顺手清理：窗口已经被关掉的，它的托盘图标也摘掉
-        for hwnd in list(getattr(self, "_window_trays", {})):
-            if not ctypes.windll.user32.IsWindow(hwnd):
-                self._drop_window_tray(hwnd)
-
     def _apply_width(self, logical_width: int) -> None:
         width = max(self.MIN_WIDTH, min(self.MAX_WIDTH, int(logical_width)))
         if width == self.width_logical:
@@ -2896,8 +3069,13 @@ class SideExplorer(QWidget):
 
     def quit_app(self) -> None:
         self._really_quit = True
-        for tray in list(getattr(self, "_window_trays", {}).values()):
-            tray.hide()
+        if getattr(self, "shot_hook", None) is not None:
+            self.shot_hook.uninstall()
+        try:
+            import screenshot
+            screenshot.stop_ocr_tasks(3000)      # 等贴图的识别线程收尾
+        except Exception:
+            pass
         if self.appbar is not None:
             self.appbar.remove()
         self.settings.setValue("width", self.width_logical)

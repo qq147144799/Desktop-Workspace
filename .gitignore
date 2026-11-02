@@ -34,3 +34,5 @@ desktop.ini
 # 注意：上传到GitHub.bat 必须用 GBK 编码保存（cmd 默认按 936 解析，UTF-8 会乱码）
 # 打包产物
 桌面工作台.exe
+# 打包后压缩的分享包
+*.zip
