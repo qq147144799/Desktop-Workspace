@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
 import archive
 import fileops
 import list_style
+import mailto
 import shutdown_timer
 import screenshot
 import shelldrag
@@ -2562,6 +2563,14 @@ class SideExplorer(QWidget):
             menu.addAction("压缩为 ZIP", lambda: self.compress_selected(entries))
         menu.addAction("添加到快捷方式",
                        lambda: self.add_to_chips([e.path for e in entries]))
+
+        # 只对文件出现：文件夹不能当附件，压缩包里的虚拟路径也没有真实文件
+        files = [e for e in entries if not e.is_dir and os.path.isfile(e.path)]
+        if files and not self._in_archive():
+            label = ("以邮件附件发送" if len(files) == 1
+                     else f"以邮件附件发送（{len(files)} 个文件）")
+            menu.addAction(label, lambda fs=files: self.send_as_mail(fs))
+
         menu.addSeparator()
         rename_act = menu.addAction("重命名         F2", self.rename_entry)
         rename_act.setEnabled(single is not None)
@@ -2574,6 +2583,21 @@ class SideExplorer(QWidget):
             menu.addAction(f"复制 {len(entries)} 个路径",
                            lambda: QApplication.clipboard().setText(
                                "\n".join(e.path for e in entries)))
+
+    def send_as_mail(self, files: list[Entry]) -> None:
+        """把选中的文件挂到邮件里：交给系统默认的邮件客户端。"""
+        paths = [e.path for e in files if not e.is_dir and os.path.isfile(e.path)]
+        if not paths:
+            self._set_status("文件夹不能作为邮件附件")
+            return
+        ok, message = mailto.send_files(paths)
+        self._set_status(message)
+        if not ok:                       # 状态栏容易被忽略，失败时再弹一次
+            QMessageBox.warning(self, "以邮件附件发送", message)
+            return
+        # 面板默认置顶，会把写邮件窗口压在下面 —— 先让开，托盘/热键随时叫回来
+        if self.topmost:
+            self.hide_to_tray()
 
     def _build_empty_menu(self, menu: QMenu) -> None:
         # 搜索放最前：找文件是第一诉求
