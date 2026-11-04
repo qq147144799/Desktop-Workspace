@@ -45,7 +45,7 @@ import screenshot
 import shelldrag
 import shellnew
 import theme
-from appbar import AppBar, primary_screen_size
+from appbar import AppBar, primary_screen_size, set_taskbar_autohide, taskbar_state
 from config import Config
 from workbench import Workbench
 
@@ -1178,6 +1178,7 @@ class SideExplorer(QWidget):
         if self.edge not in ("left", "right"):
             self.edge = "left"
         self.click_to_open = self.settings.value("click_to_open", False, bool)
+        self.hide_taskbar = self.settings.value("hide_taskbar", False, bool)
         self._really_quit = False
         self._watcher = ArchiveWatcher(self)
         self._watcher.changed.connect(self._set_status)
@@ -1905,6 +1906,7 @@ class SideExplorer(QWidget):
         self.tray.show()
         shutdown_timer.tidy(self.settings)      # 上次定时后电脑被硬关过的话，清掉旧时间
         self._update_tray_tooltip()
+        self._apply_taskbar_setting()           # 上次隐藏任务栏没退干净的话，对齐回来
 
     def _on_tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.Trigger:
@@ -2818,6 +2820,11 @@ class SideExplorer(QWidget):
         act_click.setChecked(self.click_to_open)
         act_click.triggered.connect(self.set_click_to_open)
 
+        act_tb = menu.addAction("隐藏任务栏")
+        act_tb.setCheckable(True)
+        act_tb.setChecked(self.hide_taskbar)
+        act_tb.triggered.connect(self._toggle_taskbar_hide)
+
         theme_menu = menu.addMenu("换肤")
         for key in theme.ORDER:
             act = theme_menu.addAction(theme.PALETTES[key]["label"])
@@ -2860,6 +2867,43 @@ class SideExplorer(QWidget):
         self.view.viewport().setCursor(
             Qt.PointingHandCursor if self.click_to_open else Qt.ArrowCursor)
         self._set_status("单击打开已开启" if self.click_to_open else "单击打开已关闭")
+
+    # ------------------------------------------------------------------ 任务栏
+    def _toggle_taskbar_hide(self, on: bool) -> None:
+        """托盘菜单的「隐藏任务栏」：切系统的自动隐藏开关，并记住用户原本的样子。"""
+        self.hide_taskbar = bool(on)
+        self.settings.setValue("hide_taskbar", self.hide_taskbar)
+        if self.hide_taskbar:
+            raw = self.settings.value("taskbar_autohide_orig")
+            if raw is None:                  # 第一次开：记住用户原本的样子
+                raw = taskbar_state()
+                self.settings.setValue("taskbar_autohide_orig", raw)
+            if not taskbar_state():
+                set_taskbar_autohide(True)
+        else:
+            raw = self.settings.value("taskbar_autohide_orig")
+            if raw is not None and taskbar_state() != bool(raw):
+                set_taskbar_autohide(bool(raw))
+            self.settings.setValue("taskbar_autohide_orig", None)
+        self._sync_appbar()                  # 任务栏让出的空间，面板跟着长高
+        self._set_status("任务栏已隐藏，鼠标移到底部会滑出"
+                         if on else "任务栏已恢复显示")
+
+    def _apply_taskbar_setting(self) -> None:
+        """启动时对齐任务栏设置：上次开着就继续开着；关了但没恢复完的补恢复。"""
+        self.hide_taskbar = self.settings.value("hide_taskbar", False, bool)
+        raw = self.settings.value("taskbar_autohide_orig")
+        orig = None if raw is None else bool(raw)
+        if self.hide_taskbar:
+            if orig is None:
+                orig = taskbar_state()
+                self.settings.setValue("taskbar_autohide_orig", orig)
+            if not taskbar_state():
+                set_taskbar_autohide(True)
+        elif orig is not None:
+            if taskbar_state() != orig:
+                set_taskbar_autohide(orig)
+            self.settings.setValue("taskbar_autohide_orig", None)
 
     def apply_theme(self, key: str) -> None:
         theme.set_theme(key)

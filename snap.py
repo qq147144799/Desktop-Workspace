@@ -21,21 +21,42 @@ from ctypes import wintypes
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
+# SetWindowPos 的 hWndInsertAfter 是指针宽度：直接传 -1 当 c_int 会在 64 位下
+# 变成 0x00000000FFFFFFFF，系统认不出 HWND_TOPMOST，置顶就静默失败。
+user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                wintypes.UINT)
+user32.SetWindowPos.restype = wintypes.BOOL
+
 SPI_GETWORKAREA = 0x0030
 SW_RESTORE = 9
 SW_MINIMIZE = 6
 SW_MAXIMIZE = 3
 SW_HIDE = 0
 SW_SHOW = 5
+SW_SHOWNOACTIVATE = 4
 WM_CLOSE = 0x0010
 SWP_NOACTIVATE = 0x0010
-HWND_TOP = 0
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+HWND_TOP = ctypes.c_void_p(0)
+HWND_TOPMOST = ctypes.c_void_p(-1)
+HWND_NOTOPMOST = ctypes.c_void_p(-2)
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
 
 SIDES = ("left", "right")
 
 _snapped: dict[int, str] = {}          # hwnd -> 当前贴的方向
 _saved: dict[int, "Placement"] = {}    # hwnd -> 贴之前的原位
 _hidden: set[int] = set()              # 被「后」收起来的窗口（列表里还得显示）
+_flags: dict[int, set[str]] = {}       # hwnd -> 用户给这个窗口设的常驻标记
+
+# 标记说明：
+#   "topmost"    窗口置顶
+#   "background" 后台运行：点「X」不关窗，改成收起来
+FLAG_TOPMOST = "topmost"
+FLAG_BACKGROUND = "background"
 
 
 class Placement(ctypes.Structure):
@@ -79,8 +100,8 @@ def state_of(hwnd: int) -> str | None:
         return "hidden"
     if _snapped.get(hwnd):
         return _snapped[hwnd]
-    if user32.IsZoomed(hwnd):
-        return "max"
+    if user32.IsZoomed(hwnd) or _fills_work_area(hwnd):
+        return "max"                 # 手动铺满的（Foxmail）也算最大化
     if user32.IsIconic(hwnd):
         return "min"
     return None
@@ -101,6 +122,43 @@ def prune_hidden() -> None:
         if not user32.IsWindow(hwnd):
             _hidden.discard(hwnd)
             _forget(hwnd)
+
+
+def prune_flags() -> None:
+    """窗口关掉了，它身上的常驻标记也跟着作废。"""
+    for hwnd in list(_flags):
+        if not user32.IsWindow(hwnd):
+            _flags.pop(hwnd, None)
+
+
+# ---------------------------------------------------------------- 常驻标记
+def flags_of(hwnd: int) -> set[str]:
+    """这个窗口被设了哪些常驻标记（topmost / background）。"""
+    return set(_flags.get(int(hwnd), ()))
+
+
+def has_flag(hwnd: int, name: str) -> bool:
+    return name in _flags.get(int(hwnd), ())
+
+
+def set_flag(hwnd: int, name: str, on: bool = True) -> None:
+    hwnd = int(hwnd)
+    flags = _flags.setdefault(hwnd, set())
+    if on:
+        flags.add(name)
+    else:
+        flags.discard(name)
+    if not flags:
+        _flags.pop(hwnd, None)
+
+
+def is_topmost(hwnd: int) -> bool:
+    """问系统本体，别只信标记 —— 用户可能自己把置顶取消了。"""
+    hwnd = int(hwnd)
+    if not user32.IsWindow(hwnd):
+        return False
+    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    return bool(style & WS_EX_TOPMOST)
 
 
 # ---------------------------------------------------------------- 内部工具
@@ -125,10 +183,38 @@ def _show(hwnd: int) -> None:
 
 
 # ---------------------------------------------------------------- 动作
-def snap(hwnd: int, side: str) -> str:
-    """贴到指定半边；已经在同一边则还原。
+def _fills_work_area(hwnd: int) -> bool:
+    """窗口是不是正好铺满工作区（用来判断「已经是最大化」）。"""
+    left, top, width, height = work_area()
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    return (abs(rect.left - left) <= 8 and abs(rect.top - top) <= 8
+            and abs((rect.right - rect.left) - width) <= 16
+            and abs((rect.bottom - rect.top) - height) <= 16)
 
-    返回 ``"left"`` / ``"right"``（贴上了）、``"restored"``（还原了）、
+
+def _fill_work_area(hwnd: int) -> bool:
+    """手动把窗口摆满工作区（不经过系统的最大化流程）。"""
+    left, top, width, height = work_area()
+    return bool(user32.SetWindowPos(hwnd, HWND_TOP, left, top, width, height,
+                                    SWP_NOACTIVATE))
+
+
+def _manual_max(hwnd: int) -> bool:
+    """这个窗口的最大化要自己铺，不能用 SW_MAXIMIZE。
+
+    Foxmail 在 ``WM_GETMINMAXINFO`` 里给出的是屏幕右下的坐标，系统最大化会把它
+    摆到 (960,540) 这种超出屏幕的位置（实测 zoomed 为真、窗口却看不见）。
+    """
+    import closetotray
+    return "foxmail" in closetotray.exe_of_window(hwnd)
+
+
+def snap(hwnd: int, side: str) -> str:
+    """贴到指定半边；已经在同一边就什么都不做（不再来回切换）。
+
+    返回 ``"left"`` / ``"right"``（贴上了）、``"same"``（本来就在这一边）、
     ``"gone"``（窗口没了）或 ``"failed"``。
     """
     hwnd = int(hwnd)
@@ -137,8 +223,8 @@ def snap(hwnd: int, side: str) -> str:
         _hidden.discard(hwnd)
         return "gone"
 
-    if _snapped.get(hwnd) == side:        # 再点同一边 = 还原
-        return "restored" if restore(hwnd) else "failed"
+    if _snapped.get(hwnd) == side:        # 已经是这个状态，保持不动
+        return "same"
 
     place = Placement()
     place.length = ctypes.sizeof(Placement)
@@ -163,18 +249,29 @@ def snap(hwnd: int, side: str) -> str:
 
 
 def maximize(hwnd: int) -> str:
-    """最大化；已经最大化就还原。返回 "maximized" / "restored" / "gone"。"""
+    """最大化；已经最大化就保持不动。返回 "maximized" / "same" / "gone" / "failed"。"""
     hwnd = int(hwnd)
     if not user32.IsWindow(hwnd):
         _forget(hwnd)
         _hidden.discard(hwnd)
         return "gone"
-    _show(hwnd)
-    if user32.IsZoomed(hwnd):
+    _show(hwnd)                        # 最小化的先叫回来（Foxmail 就是最小化到托盘的）
+
+    if _manual_max(hwnd):
+        # Foxmail 这类程序：系统最大化会摆到屏幕外，只能自己铺满；
+        # 而且它可能已经带着「zoomed」标记却停在屏幕外，所以判据是「真的铺满了没有」
+        if _fills_work_area(hwnd):
+            _bring_front(hwnd)
+            return "same"
         _forget(hwnd)
-        user32.ShowWindow(hwnd, SW_RESTORE)
+        if not _fill_work_area(hwnd):
+            return "failed"
         _bring_front(hwnd)
-        return "restored"
+        return "maximized"
+
+    if user32.IsZoomed(hwnd) or _fills_work_area(hwnd):
+        _bring_front(hwnd)                # 已经是最大，只把它叫到前面
+        return "same"
     _forget(hwnd)                     # 之前贴在半边的话，最大化后就作废了
     user32.ShowWindow(hwnd, SW_MAXIMIZE)
     _bring_front(hwnd)
@@ -182,18 +279,17 @@ def maximize(hwnd: int) -> str:
 
 
 def minimize(hwnd: int) -> str:
-    """最小化；已经最小化就还原。返回 "minimized" / "restored" / "gone"。"""
+    """最小化；已经最小化就保持不动。返回 "minimized" / "same" / "gone"。"""
     hwnd = int(hwnd)
     if not user32.IsWindow(hwnd):
         _forget(hwnd)
         _hidden.discard(hwnd)
         return "gone"
-    _show(hwnd)
-    if user32.IsIconic(hwnd):
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        _bring_front(hwnd)
-        return "restored"
+    if user32.IsIconic(hwnd) and hwnd not in _hidden:
+        return "same"
     _forget(hwnd)
+    _hidden.discard(hwnd)
+    # 对我们收起来的窗口，SW_MINIMIZE 会让它以「最小化」的形式回到任务栏
     user32.ShowWindow(hwnd, SW_MINIMIZE)
     return "minimized"
 
@@ -218,6 +314,36 @@ def hide_window(hwnd: int) -> str:
     return "hidden"
 
 
+def activate(hwnd: int) -> str:
+    """像点任务栏那样把窗口叫到前台：隐藏的显示、最小化的还原、最大化的保持。"""
+    hwnd = int(hwnd)
+    if not user32.IsWindow(hwnd):
+        _forget(hwnd)
+        _hidden.discard(hwnd)
+        _flags.pop(hwnd, None)
+        return "gone"
+    _show(hwnd)
+    _bring_front(hwnd)
+    return "ok"
+
+
+def set_topmost(hwnd: int, on: bool) -> str:
+    """置顶 / 取消置顶，并把这个选择记成窗口的常驻标记。"""
+    hwnd = int(hwnd)
+    if not user32.IsWindow(hwnd):
+        _forget(hwnd)
+        _hidden.discard(hwnd)
+        _flags.pop(hwnd, None)
+        return "gone"
+    ok = user32.SetWindowPos(hwnd, HWND_TOPMOST if on else HWND_NOTOPMOST,
+                             0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+    if not ok:
+        return "failed"
+    set_flag(hwnd, FLAG_TOPMOST, on)
+    return FLAG_TOPMOST if on else "normal"
+
+
 def close_window(hwnd: int) -> bool:
     """发 WM_CLOSE，走程序自己的关闭流程（该弹「要保存吗」就弹）。"""
     hwnd = int(hwnd)
@@ -226,6 +352,47 @@ def close_window(hwnd: int) -> bool:
     if not user32.IsWindow(hwnd):
         return False
     return bool(user32.PostMessageW(hwnd, WM_CLOSE, 0, 0))
+
+
+def close_or_hide(hwnd: int) -> str:
+    """点「X」：设了「后台运行」的窗口只收起来，不真关。
+
+    返回 "closed"（发了关闭消息）/ "hidden"（转到后台）/ "gone"（窗口没了）。
+    """
+    hwnd = int(hwnd)
+    if has_flag(hwnd, FLAG_BACKGROUND):
+        if hwnd in _hidden or not user32.IsWindowVisible(hwnd):
+            return "hidden"                 # 已经在后台了，再点一次什么都不做
+        if hide_window(hwnd) == "hidden":
+            return "hidden"
+        return "gone"
+    return "closed" if close_window(hwnd) else "gone"
+
+
+def revive_background() -> list[int]:
+    """后台运行模式下被「窗口自己的 X」关掉的窗口，重新拉出来。
+
+    跨进程拦不住 WM_CLOSE（那要往对方进程注入代码），但 Foxmail / 微信这类托盘程序
+    点 X 只是把自己藏起来，窗口对象还在 —— 所以能在这里发现并叫回来。
+    真退出进程的救不了，只能等它从列表消失。
+
+    返回被拉回来的 hwnd 列表。
+    """
+    revived = []
+    for hwnd in list(_flags):
+        if not has_flag(hwnd, FLAG_BACKGROUND):
+            continue
+        if not user32.IsWindow(hwnd):
+            _flags.pop(hwnd, None)          # 已经真关了，标记作废
+            continue
+        if hwnd in _hidden or user32.IsWindowVisible(hwnd):
+            continue                        # 我们自己收起来的，或本来就好好显示着
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        else:
+            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+        revived.append(hwnd)
+    return revived
 
 
 def restore(hwnd: int) -> bool:

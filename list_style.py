@@ -34,18 +34,24 @@ def body_rect(row: QRect) -> QRect:
     return row.adjusted(INSET_X, INSET_Y, -INSET_X, -INSET_Y)
 
 
-def paint_row(painter, row: QRect, option, fill: QColor | None = None) -> QRect:
-    """画行的底色：常驻底色 → 选中 → 悬停。返回内容区。"""
+def paint_row(painter, row: QRect, option, fill: QColor | None = None,
+              hover: bool = False) -> QRect:
+    """画行的底色：常驻底色 → 选中 → 悬停。返回内容区。
+
+    自绘控件（没有 QStyleOptionViewItem）传 ``option=None``，用 ``hover`` 表达悬停。
+    """
     body = body_rect(row)
     if fill is not None:
         painter.setPen(Qt.NoPen)
         painter.setBrush(fill)
         painter.drawRoundedRect(body, RADIUS, RADIUS)
-    if option.state & QStyle.State_Selected:
+    selected = option is not None and bool(option.state & QStyle.State_Selected)
+    hovered = hover or (option is not None and bool(option.state & QStyle.State_MouseOver))
+    if selected:
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(theme.color("sel")))
         painter.drawRoundedRect(body, RADIUS, RADIUS)
-    elif option.state & QStyle.State_MouseOver:
+    elif hovered:
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(theme.color("hover")))
         painter.drawRoundedRect(body, RADIUS, RADIUS)

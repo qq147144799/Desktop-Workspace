@@ -52,6 +52,11 @@ ABM_REMOVE = 0x00000001
 ABM_QUERYPOS = 0x00000002
 ABM_SETPOS = 0x00000003
 ABM_GETSTATE = 0x00000004
+ABM_SETSTATE = 0x0000000A
+
+# 任务栏状态位（ABM_GETSTATE 的返回值 / ABM_SETSTATE 的 lParam）
+ABS_AUTOHIDE = 0x00000001
+ABS_ALWAYSONTOP = 0x00000002
 
 # 边缘
 ABE_LEFT = 0
@@ -191,3 +196,24 @@ def primary_screen_size() -> tuple[int, int]:
         user32.GetSystemMetrics(0),   # SM_CXSCREEN
         user32.GetSystemMetrics(1),   # SM_CYSCREEN
     )
+
+
+# ---------------------------------------------------------------- 任务栏开关
+def taskbar_state() -> bool:
+    """任务栏当前是否处于「自动隐藏」。"""
+    abd = APPBARDATA()
+    abd.cbSize = ctypes.sizeof(APPBARDATA)
+    state = shell32.SHAppBarMessage(ABM_GETSTATE, ctypes.byref(abd))
+    return bool(state & ABS_AUTOHIDE)
+
+
+def set_taskbar_autohide(on: bool) -> bool:
+    """切任务栏的「自动隐藏」开关。
+
+    这是系统级设置（等同用户在 Windows 设置里手动勾选），即时生效、不用重启
+    explorer。调用方负责记住原来的状态，不用了要恢复。
+    """
+    abd = APPBARDATA()
+    abd.cbSize = ctypes.sizeof(APPBARDATA)
+    abd.lParam = ABS_AUTOHIDE if on else 0
+    return bool(shell32.SHAppBarMessage(ABM_SETSTATE, ctypes.byref(abd)))

@@ -190,7 +190,10 @@ class TabStrip(QWidget):
         if event.button() == Qt.LeftButton:
             index = self._at(event.position().x())
             if index >= 0:
-                self.set_current(index)
+                if index == self._index:
+                    self.changed.emit(index)   # 再点一次当前页签 = 让这一页刷新一下
+                else:
+                    self.set_current(index)
             QToolTip.hideText()
         super().mousePressEvent(event)
 
@@ -313,11 +316,16 @@ class Workbench(QWidget):
 
     # ------------------------------------------------------------------ 切页
     def _switch(self, index: int) -> None:
+        # 先让旧页面收摊（窗口管理器靠这个停掉轮询定时器），再激活新的
+        previous = getattr(self, "_active_index", -1)
+        if 0 <= previous < len(self.pages) and previous != index:
+            self.pages[previous].deactivate()
         page = self.pages[index]
         self.stack.setCurrentIndex(index)
         self.tabs.set_current(index, notify=False)
         self.btn_more.setToolTip(f"{page.title} · 更多")
         page.activate()
+        self._active_index = index
 
     def _more(self) -> None:
         self.pages[self.tabs.current()].menu(self.btn_more)
